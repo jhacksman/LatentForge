@@ -1,0 +1,21 @@
+# Default configuration for autoencoder training
+
+# Model architecture
+k: 8  # Compression factor (tokens per latent)
+latent_dim: 1024
+embed_dim: 768
+num_layers: 4
+
+# Training
+batch_size: 32
+epochs: 10
+lr: 0.0001
+l2_weight: 0.001
+
+# Data
+data: "data/packed/train"
+
+# Hardware
+bf16: true
+
+# Target: ≥99.5% exact reconstruction on validation
