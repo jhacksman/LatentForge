@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Checkpoints and data
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+data/
+*.json
+*.jsonl
+*.txt.gz
+*.txt
+!requirements.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Analysis file
+CALM_IMPLEMENTATION_ANALYSIS.md
