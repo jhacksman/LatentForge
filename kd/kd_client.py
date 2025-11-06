@@ -7,7 +7,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import requests
-import numpy as np
 from dotenv import load_dotenv
 
 
@@ -31,6 +30,7 @@ class VeniceKDClient:
         model: Optional[str] = None,
         timeout: int = 60,
         max_retries: int = 3,
+        max_backoff: float = 32.0,
     ):
         """
         Initialize Venice KD client.
@@ -41,6 +41,7 @@ class VeniceKDClient:
             model: Model name (default from env)
             timeout: Request timeout in seconds
             max_retries: Maximum retry attempts
+            max_backoff: Maximum backoff time in seconds
         """
         load_dotenv()
 
@@ -49,11 +50,152 @@ class VeniceKDClient:
         self.model = model or os.getenv("VENICE_MODEL")
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_backoff = max_backoff
 
         if not all([self.base_url, self.api_key, self.model]):
             raise ValueError("Missing Venice API credentials. Check .env file.")
 
-        self.endpoint = f"{self.base_url}/chat/completions"
+        self.completions_endpoint = f"{self.base_url}/chat/completions"
+        self.models_endpoint = f"{self.base_url}/models"
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Get request headers with authorization."""
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _handle_request_with_backoff(
+        self,
+        method: str,
+        url: str,
+        **kwargs,
+    ) -> requests.Response:
+        """
+        Make HTTP request with exponential backoff for retryable errors.
+
+        Args:
+            method: HTTP method (GET, POST)
+            url: Request URL
+            **kwargs: Additional request arguments
+
+        Returns:
+            Response object
+
+        Raises:
+            RuntimeError: On auth errors or max retries exceeded
+        """
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.request(method, url, **kwargs)
+
+                # Check for auth errors (don't retry)
+                if response.status_code == 401:
+                    raise RuntimeError(
+                        "Authentication failed. Check your VENICE_API_KEY in .env file."
+                    )
+
+                # Check for rate limiting or server errors (retry with backoff)
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt < self.max_retries - 1:
+                        # Capped exponential backoff
+                        backoff = min(2 ** attempt, self.max_backoff)
+                        time.sleep(backoff)
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"API request failed after {self.max_retries} retries. "
+                            f"Status: {response.status_code}, Response: {response.text}"
+                        )
+
+                # Raise for other HTTP errors
+                response.raise_for_status()
+                return response
+
+            except requests.exceptions.Timeout as e:
+                if attempt < self.max_retries - 1:
+                    backoff = min(2 ** attempt, self.max_backoff)
+                    time.sleep(backoff)
+                    continue
+                raise RuntimeError(f"Request timed out after {self.max_retries} attempts: {e}")
+
+            except requests.exceptions.ConnectionError as e:
+                if attempt < self.max_retries - 1:
+                    backoff = min(2 ** attempt, self.max_backoff)
+                    time.sleep(backoff)
+                    continue
+                raise RuntimeError(f"Connection error after {self.max_retries} attempts: {e}")
+
+            except requests.exceptions.RequestException as e:
+                # Don't retry for other request exceptions
+                raise RuntimeError(f"Request failed: {e}")
+
+        raise RuntimeError(f"Request failed after {self.max_retries} attempts")
+
+    def list_models(self) -> List[Dict]:
+        """
+        List available models from Venice API.
+
+        Returns:
+            List of model dictionaries with id, name, etc.
+
+        Raises:
+            RuntimeError: On API errors
+        """
+        response = self._handle_request_with_backoff(
+            "GET",
+            self.models_endpoint,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        )
+
+        data = response.json()
+        return data.get("data", [])
+
+    def get_logprobs(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 128,
+        top_logprobs: int = 20,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+    ) -> TeacherOutput:
+        """
+        Get logprobs from chat completion.
+
+        Args:
+            messages: List of message dicts with role and content
+            max_tokens: Maximum tokens to generate
+            top_logprobs: Number of top logprobs to return (1-20)
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+
+        Returns:
+            TeacherOutput with sparse per-position distributions
+
+        Raises:
+            RuntimeError: On API errors
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "logprobs": True,
+            "top_logprobs": top_logprobs,
+        }
+
+        response = self._handle_request_with_backoff(
+            "POST",
+            self.completions_endpoint,
+            headers=self._get_headers(),
+            json=payload,
+            timeout=self.timeout,
+        )
+
+        data = response.json()
+        return self._parse_response(data)
 
     def get_teacher_distribution(
         self,
@@ -76,38 +218,14 @@ class VeniceKDClient:
         Returns:
             TeacherOutput with tokens and distributions
         """
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "logprobs": True,
-            "top_logprobs": top_logprobs,
-        }
-
-        for attempt in range(self.max_retries):
-            try:
-                response = requests.post(
-                    self.endpoint,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                break
-            except requests.exceptions.RequestException as e:
-                if attempt == self.max_retries - 1:
-                    raise RuntimeError(f"Venice API request failed: {e}")
-                time.sleep(2 ** attempt)  # Exponential backoff
-
-        data = response.json()
-        return self._parse_response(data)
+        messages = [{"role": "user", "content": prompt}]
+        return self.get_logprobs(
+            messages=messages,
+            max_tokens=max_tokens,
+            top_logprobs=top_logprobs,
+            temperature=temperature,
+            top_p=top_p,
+        )
 
     def _parse_response(self, data: Dict) -> TeacherOutput:
         """
