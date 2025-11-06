@@ -1,0 +1,15 @@
+# Inference configuration
+
+# Model paths
+ae_checkpoint: "checkpoints/ae.pt"
+student_checkpoint: "checkpoints/student.pt"
+
+# Sampling parameters
+max_new_tokens: 128
+temperature: 0.8
+top_p: 0.95
+top_k: 0
+seed: null
+
+# Device
+device: "cuda"  # or "cpu"

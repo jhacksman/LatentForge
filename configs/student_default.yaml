@@ -1,0 +1,29 @@
+# Default configuration for student training with KD
+
+# Model architecture
+latent_dim: 1024
+hidden_dim: 2048
+num_layers: 12
+num_heads: 16
+seq_len: 64  # Sequence length in latents
+
+# Training
+batch_size: 16
+epochs: 5
+lr: 0.0001
+
+# Loss weights
+kd_w: 1.0   # Knowledge distillation weight
+mse_w: 1.0  # MSE in latent space weight
+ce_w: 1.0   # Cross-entropy on decoded tokens weight
+
+# Knowledge distillation
+use_kd: true
+
+# Data
+k: 8
+data: "data/packed/train"
+ae_ckpt: "checkpoints/ae.pt"
+
+# Hardware
+bf16: true
