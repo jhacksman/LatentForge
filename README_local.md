@@ -10,7 +10,7 @@ This implementation achieves ~K× speedup (K=8 by default) by operating in compr
 
 - **Autoencoder (AE)**: Compresses K tokens → 1 latent vector (default K=8)
 - **Student Transformer**: Predicts next latent autoregressively
-- **Knowledge Distillation**: From Qwen 3 Next 80B via Venice API logprobs
+- **Knowledge Distillation**: From Qwen 3 Next 80B via Venice API with sparse top_logprobs (top-20 tokens per position)
 - **Full Stack**: CLI, REST API, benchmarking, and comprehensive tests
 
 ### Key Features
@@ -139,9 +139,11 @@ make train-student
 This trains the student to predict next latents with:
 - **CE loss**: Cross-entropy on decoded tokens
 - **MSE loss**: Mean squared error in latent space
-- **KD loss**: KL divergence to teacher distributions
+- **KD loss**: KL divergence to teacher distributions from sparse top_logprobs (top-20 tokens per position)
 
 Default weights: `KD_W=1.0`, `MSE_W=1.0`, `CE_W=1.0`
+
+**Note**: The KD loss uses Venice API's `top_logprobs=20` parameter to get sparse teacher distributions, providing efficient knowledge transfer without requiring full vocabulary distributions.
 
 Checkpoint saved to: `checkpoints/student.pt`
 

@@ -2,15 +2,20 @@
 """
 Benchmark script for LatentForge.
 Measures latent steps per second and decoded tokens per second.
+Includes evaluation on toy dataset for reconstruction rate and KL to teacher.
 """
 import argparse
 import time
 import json
+import math
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 import torch
+import torch.nn.functional as F
 
 from student.sampler import LatentSampler, load_models
+from kd.kd_client import VeniceKDClient
+from ae.tokenizer_adapter import TokenizerAdapter
 
 try:
     from tabulate import tabulate
@@ -159,6 +164,173 @@ def benchmark_generation(
     return results
 
 
+def evaluate_on_toy_set(
+    sampler: LatentSampler,
+    data_path: str,
+    kd_client: Optional[VeniceKDClient] = None,
+    num_samples: int = 100,
+    num_kd_samples: int = 10,
+) -> Dict:
+    """
+    Evaluate on toy dataset.
+
+    Args:
+        sampler: LatentSampler instance
+        data_path: Path to packed data directory
+        kd_client: Optional KD client for teacher KL computation
+        num_samples: Number of samples to evaluate reconstruction
+        num_kd_samples: Number of samples to evaluate KL to teacher
+
+    Returns:
+        Evaluation results dictionary
+    """
+    print(f"\n{'='*60}")
+    print(f"Evaluating on toy dataset...")
+    print(f"{'='*60}\n")
+
+    # Load toy data
+    data_file = Path(data_path) / "sequences.pt"
+    if not data_file.exists():
+        print(f"⚠️  Data file not found: {data_file}")
+        return {"error": "Data file not found"}
+
+    sequences = torch.load(data_file)
+    sequences = sequences[:num_samples]  # Limit samples
+
+    # Metrics
+    total_tokens = 0
+    correct_tokens = 0
+    total_chunks = 0
+    exact_match_chunks = 0
+
+    print(f"Evaluating reconstruction on {len(sequences)} sequences...")
+
+    for seq in sequences:
+        # Split into chunks of K
+        k = sampler.k
+        num_chunks = len(seq) // k
+
+        for i in range(num_chunks):
+            chunk = seq[i * k : (i + 1) * k]
+            if len(chunk) < k:
+                continue
+
+            chunk_tensor = chunk.unsqueeze(0).to(sampler.device)  # (1, k)
+
+            # Encode and decode
+            with torch.no_grad():
+                latent = sampler.autoencoder.encode(chunk_tensor)
+                decoded_logits = sampler.autoencoder.decode(latent)  # (1, k, vocab_size)
+                decoded_ids = decoded_logits.argmax(dim=-1).squeeze(0)  # (k,)
+
+            # Count matches
+            matches = (decoded_ids == chunk).sum().item()
+            correct_tokens += matches
+            total_tokens += k
+            total_chunks += 1
+
+            if matches == k:
+                exact_match_chunks += 1
+
+    # Reconstruction metrics
+    token_accuracy = correct_tokens / total_tokens if total_tokens > 0 else 0.0
+    exact_match_rate = exact_match_chunks / total_chunks if total_chunks > 0 else 0.0
+
+    results = {
+        "reconstruction": {
+            "total_tokens": total_tokens,
+            "correct_tokens": correct_tokens,
+            "token_accuracy": token_accuracy,
+            "total_chunks": total_chunks,
+            "exact_match_chunks": exact_match_chunks,
+            "exact_match_rate": exact_match_rate,
+        }
+    }
+
+    print(f"\nReconstruction Results:")
+    print(f"  Token accuracy: {token_accuracy*100:.2f}%")
+    print(f"  Exact match rate: {exact_match_rate*100:.2f}%")
+    print(f"  Total chunks: {total_chunks}")
+
+    # KL to teacher (optional, more expensive)
+    if kd_client and num_kd_samples > 0:
+        print(f"\nEvaluating KL to teacher on {num_kd_samples} samples...")
+
+        kl_divergences = []
+        tokenizer = TokenizerAdapter()
+
+        for idx in range(min(num_kd_samples, len(sequences))):
+            seq = sequences[idx]
+            k = sampler.k
+
+            # Take first chunk
+            if len(seq) < k:
+                continue
+
+            chunk = seq[:k]
+            chunk_text = tokenizer.decode(chunk, skip_special_tokens=True)
+
+            try:
+                # Get teacher distribution
+                teacher_output = kd_client.get_teacher_distribution(
+                    prompt=chunk_text,
+                    max_tokens=k,
+                    temperature=1.0,
+                    top_logprobs=20,
+                )
+
+                # Get student distribution via AE decode
+                chunk_tensor = chunk.unsqueeze(0).to(sampler.device)
+                with torch.no_grad():
+                    latent = sampler.autoencoder.encode(chunk_tensor)
+                    student_logits = sampler.autoencoder.decode(latent)  # (1, k, vocab_size)
+
+                # Compute KL for each position where we have teacher probs
+                for pos in range(min(k, len(teacher_output.normalized_probs))):
+                    teacher_probs_dict = teacher_output.normalized_probs[pos]
+
+                    if not teacher_probs_dict:
+                        continue
+
+                    # Get student probabilities for this position
+                    student_probs = F.softmax(student_logits[0, pos, :], dim=-1)  # (vocab_size,)
+
+                    # Compute KL divergence (sparse teacher, dense student)
+                    kl = 0.0
+                    for token_str, teacher_prob in teacher_probs_dict.items():
+                        # Get token ID from teacher token string
+                        # This is approximate - in production would need proper alignment
+                        token_ids = tokenizer.encode(token_str, add_special_tokens=False)
+                        if len(token_ids) > 0:
+                            token_id = token_ids[0]
+                            student_prob = student_probs[token_id].item()
+
+                            # KL(teacher || student) = sum(teacher * log(teacher / student))
+                            if teacher_prob > 0 and student_prob > 0:
+                                kl += teacher_prob * math.log(teacher_prob / student_prob)
+
+                    kl_divergences.append(kl)
+
+            except Exception as e:
+                print(f"  ⚠️  KL evaluation failed for sample {idx}: {e}")
+                continue
+
+        if kl_divergences:
+            avg_kl = sum(kl_divergences) / len(kl_divergences)
+            results["kl_to_teacher"] = {
+                "num_samples": len(kl_divergences),
+                "avg_kl_divergence": avg_kl,
+                "kl_divergences": kl_divergences[:10],  # Store first 10
+            }
+            print(f"\nKL to Teacher:")
+            print(f"  Average KL divergence: {avg_kl:.4f}")
+            print(f"  Evaluated on {len(kl_divergences)} positions")
+        else:
+            print(f"  ⚠️  No KL divergences computed")
+
+    return results
+
+
 def print_summary(results: Dict):
     """Print benchmark summary."""
     print(f"\n{'='*60}")
@@ -208,6 +380,10 @@ def main():
     parser.add_argument("--num_runs", type=int, default=3, help="Runs per prompt")
     parser.add_argument("--output", type=str, help="Output JSON file")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--eval", action="store_true", help="Run evaluation on toy dataset")
+    parser.add_argument("--eval_data", type=str, default="./data", help="Path to eval data directory")
+    parser.add_argument("--eval_num_samples", type=int, default=100, help="Number of samples for reconstruction eval")
+    parser.add_argument("--eval_kd_samples", type=int, default=10, help="Number of samples for KL to teacher eval")
     args = parser.parse_args()
 
     # Device
@@ -256,6 +432,28 @@ def main():
 
     # Print summary
     print_summary(results)
+
+    # Run evaluation if requested
+    if args.eval:
+        # Initialize KD client if available
+        kd_client = None
+        try:
+            kd_client = VeniceKDClient()
+            print("✅ KD client initialized for teacher KL evaluation")
+        except Exception as e:
+            print(f"⚠️  KD client initialization failed: {e}")
+            print("   Skipping KL to teacher evaluation")
+
+        eval_results = evaluate_on_toy_set(
+            sampler=sampler,
+            data_path=args.eval_data,
+            kd_client=kd_client,
+            num_samples=args.eval_num_samples,
+            num_kd_samples=args.eval_kd_samples,
+        )
+
+        # Add eval results to main results
+        results["evaluation"] = eval_results
 
     # Save results
     if args.output:

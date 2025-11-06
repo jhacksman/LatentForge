@@ -5,12 +5,14 @@ Train student transformer with knowledge distillation from teacher.
 import os
 import sys
 import argparse
+import csv
 from pathlib import Path
 import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 import json
 
@@ -117,10 +119,16 @@ def train_epoch(
     mse_weight: float = 1.0,
     ce_weight: float = 1.0,
     use_kd: bool = True,
+    gradient_accumulation_steps: int = 1,
+    use_activation_checkpointing: bool = False,
 ) -> dict:
     """Train for one epoch."""
     student.train()
     autoencoder.eval()  # Freeze autoencoder
+
+    # Enable activation checkpointing if requested
+    if use_activation_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
+        student.gradient_checkpointing_enable()
 
     total_loss = 0.0
     total_metrics = {
@@ -129,6 +137,7 @@ def train_epoch(
         "kd_loss": 0.0,
     }
     num_batches = 0
+    accumulation_counter = 0
 
     pbar = tqdm(dataloader, desc="Training")
     for batch_idx, chunks in enumerate(pbar):
@@ -144,7 +153,9 @@ def train_epoch(
             latents = latents.reshape(batch_size, seq_len, -1)  # (batch_size, seq_len, latent_dim)
 
         # Student forward: predict next latent
-        optimizer.zero_grad()
+        # Zero gradients at the start of accumulation cycle
+        if accumulation_counter % gradient_accumulation_steps == 0:
+            optimizer.zero_grad()
 
         # Input: latents[:-1], Target: latents[1:]
         input_latents = latents[:, :-1, :]
@@ -206,12 +217,19 @@ def train_epoch(
             ce_weight * ce_loss + mse_weight * mse_loss + kd_weight * kd_loss
         )
 
-        # Backward
-        total_loss_batch.backward()
-        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-        optimizer.step()
+        # Scale loss for gradient accumulation
+        scaled_loss = total_loss_batch / gradient_accumulation_steps
 
-        # Accumulate
+        # Backward
+        scaled_loss.backward()
+
+        # Step optimizer every gradient_accumulation_steps
+        accumulation_counter += 1
+        if accumulation_counter % gradient_accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+            optimizer.step()
+
+        # Accumulate metrics (use original unscaled loss for reporting)
         total_loss += total_loss_batch.item()
         total_metrics["ce_loss"] += ce_loss.item()
         total_metrics["mse_loss"] += mse_loss.item()
@@ -253,6 +271,9 @@ def main():
     parser.add_argument("--ce_w", type=float, default=1.0, help="CE loss weight")
     parser.add_argument("--use_kd", action="store_true", help="Enable KD")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--use_activation_checkpointing", action="store_true", help="Enable activation checkpointing")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Checkpoint dir")
     parser.add_argument("--config", type=str, help="Config file (YAML)")
     args = parser.parse_args()
@@ -264,6 +285,12 @@ def main():
             for key, value in config.items():
                 if not hasattr(args, key) or getattr(args, key) is None:
                     setattr(args, key, value)
+
+    # Set deterministic seeds for reproducibility
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    print(f"Set random seed: {args.seed}")
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -322,7 +349,22 @@ def main():
 
     # Training
     print(f"\nTraining for {args.epochs} epochs...")
+    print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    print(f"Activation checkpointing: {args.use_activation_checkpointing}")
     best_loss = float("inf")
+
+    # CSV logging
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    csv_path = results_dir / "student_metrics.csv"
+
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.DictWriter(
+        csv_file,
+        fieldnames=["epoch", "loss", "ce_loss", "mse_loss", "kd_loss"],
+    )
+    csv_writer.writeheader()
+    print(f"Logging metrics to {csv_path}")
 
     for epoch in range(args.epochs):
         print(f"\n=== Epoch {epoch + 1}/{args.epochs} ===")
@@ -340,11 +382,20 @@ def main():
             mse_weight=args.mse_w,
             ce_weight=args.ce_w,
             use_kd=args.use_kd,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            use_activation_checkpointing=args.use_activation_checkpointing,
         )
 
         print(f"\nTrain metrics:")
         for key, value in train_metrics.items():
             print(f"  {key}: {value:.4f}")
+
+        # Log to CSV
+        csv_writer.writerow({
+            "epoch": epoch + 1,
+            **train_metrics,
+        })
+        csv_file.flush()
 
         # Save checkpoint
         os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -368,8 +419,10 @@ def main():
             )
             print(f"✅ Saved checkpoint: {checkpoint_path}")
 
+    csv_file.close()
     print(f"\n🎉 Training complete!")
     print(f"Best loss: {best_loss:.4f}")
+    print(f"Metrics saved to {csv_path}")
 
 
 if __name__ == "__main__":
