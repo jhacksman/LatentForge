@@ -1,48 +1,24 @@
 # LatentForge
 
-A minimal stack to distill a token-level LLM into a CALM-style latent-vector autoregressive model using **Qwen 3 Next 80B** as the frozen teacher via the Venice API.
+**LatentForge** is a minimal stack to distill a token-level LLM into a CALM-style latent-vector autoregressive model using **Qwen 3 Next 80B** as the frozen teacher via the Venice API.
+
+This implementation achieves ~K× speedup (K=8 by default) by operating in compressed latent space instead of token space, with knowledge distillation from teacher logprobs.
 
 ## Overview
 
-LatentForge implements:
+### Architecture
 
-- **Autoencoder (AE)**: Maps K tokens → 1 latent vector (default K=8)
-- **Student Transformer**: Predicts next latent vector autoregressively
-- **Knowledge Distillation**: From Qwen 3 Next 80B teacher via Venice API
-- **CLI & REST API**: Easy inference and serving
+- **Autoencoder (AE)**: Compresses K tokens → 1 latent vector (default K=8)
+- **Student Transformer**: Predicts next latent autoregressively
+- **Knowledge Distillation**: From Qwen 3 Next 80B via Venice API logprobs
+- **Full Stack**: CLI, REST API, benchmarking, and comprehensive tests
 
 ### Key Features
 
-- **K× faster inference**: ~8× fewer autoregressive steps than token-level models
-- **Flexible compression**: Configurable K parameter
-- **Knowledge distillation**: Learn from teacher logprobs via Venice API
-- **Production-ready**: FastAPI server, benchmarking tools, Docker support
-
-## Architecture
-
-```
-Input Text → Tokenize → [Token₁, Token₂, ..., Tokenₖ]
-                              ↓
-                         Autoencoder
-                              ↓
-                         Latent z₁
-                              ↓
-                    Student Transformer
-                              ↓
-                     Predicted Latent z₂
-                              ↓
-                     AE Decoder
-                              ↓
-              [Token_{k+1}, ..., Token_{2k}]
-```
-
-### Training Process
-
-1. **AE Training**: Learn to compress K tokens into 1 latent (≥99.5% reconstruction)
-2. **Student Training**: Predict next latent with KD from teacher
-   - CE loss on decoded tokens
-   - MSE loss in latent space
-   - KL divergence to teacher distributions
+- **K× fewer AR steps**: ~8× speedup by compressing tokens into latents
+- **Teacher distillation**: KL divergence loss from Qwen 3 Next 80B logprobs
+- **Production-ready**: FastAPI server with CORS, pytest test suite
+- **Flexible losses**: Configurable CE, MSE, and KD weights
 
 ## Setup
 
@@ -51,160 +27,246 @@ Input Text → Tokenize → [Token₁, Token₂, ..., Tokenₖ]
 - Python 3.8+
 - PyTorch 2.0+
 - CUDA (optional, for GPU acceleration)
-- Venice API key
+- Venice API key for Qwen 3 Next 80B
 
 ### Installation
 
+Clone the repository:
+
 ```bash
-# Clone repository
 git clone https://github.com/jhacksman/LatentForge
 cd LatentForge
-
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
 ```
 
-### Configuration
+### Environment Setup
 
-Create `.env` file with your Venice API credentials:
+Create `.env` file at the repository root with your Venice API credentials:
 
 ```bash
+cat > .env <<'EOF'
 VENICE_BASE_URL=https://api.venice.ai/api/v1
 VENICE_API_KEY=your_api_key_here
 VENICE_MODEL=qwen3-next-80b
+EOF
 ```
 
-**Important**: Never commit `.env` to version control!
+**Important**: The `.env` file is in `.gitignore` and should never be committed!
 
-### Verify API Connection
+### Install Dependencies
+
+Create virtual environment and install dependencies:
 
 ```bash
-make check-api
-# or
-python tools/verify_api.py
+make setup
+```
+
+This will:
+- Create `.venv/` virtual environment
+- Install all dependencies (PyTorch, transformers, FastAPI, pytest, etc.)
+- Create necessary directories
+
+Then activate the environment:
+
+```bash
+source .venv/bin/activate
 ```
 
 ## Quick Start
 
-### 1. Prepare Data
+### 1. Verify Venice API
 
-Pack your text data into sequences:
+Check that your API credentials work and Qwen 3 Next 80B is available:
 
 ```bash
-python tools/data_packing.py \
-  --input data/text.jsonl \
-  --output data/packed \
-  --seq_len 4096 \
-  --k 8
+make check-api
 ```
 
-### 2. Train Autoencoder
+Expected output:
+```
+Test 1: Listing available models...
+✅ Found N models
+✅ Target model 'qwen3-next-80b' is available
+✅ supportsLogProbs: True
+
+Test 2: Chat completion with logprobs...
+✅ Chat completion successful
+✅ Logprobs are working correctly
+
+🎉 All checks passed! Venice API is ready for use.
+```
+
+### 2. Create Toy Dataset
+
+Generate a small test dataset for development:
+
+```bash
+make toy
+```
+
+This creates `./data/toy.jsonl` and packs it into `./data/packed_toy/` with sequences of length 2048 (multiple of K=8).
+
+### 3. Train Autoencoder
+
+Train the autoencoder to compress K=8 tokens into 1 latent:
+
+```bash
+make train-ae
+```
+
+Target: ≥99.5% exact reconstruction rate on validation set.
+
+Default parameters:
+- `K=8` (compression factor)
+- `D=1024` (latent dimension)
+- `EPOCHS=1` (for quick testing)
+
+For better results:
 
 ```bash
 make train-ae K=8 D=1024 EPOCHS=10
-# or
-python ae/train_ae.py \
-  --data data/packed/train \
-  --k 8 \
-  --latent_dim 1024 \
-  --epochs 10 \
-  --bf16
 ```
 
-**Target**: ≥99.5% exact reconstruction on validation
+Checkpoint saved to: `checkpoints/ae.pt`
 
-### 3. Train Student with KD
+### 4. Train Student with KD
+
+Train the student transformer with knowledge distillation:
 
 ```bash
-make train-student KD_W=1.0 MSE_W=1.0 CE_W=1.0
-# or
-python student/train_student.py \
-  --data data/packed/train \
-  --ae_ckpt checkpoints/ae.pt \
-  --k 8 \
-  --latent_dim 1024 \
-  --kd_w 1.0 --mse_w 1.0 --ce_w 1.0 \
-  --use_kd \
-  --bf16
+make train-student
 ```
 
-### 4. Generate Text
+This trains the student to predict next latents with:
+- **CE loss**: Cross-entropy on decoded tokens
+- **MSE loss**: Mean squared error in latent space
+- **KD loss**: KL divergence to teacher distributions
+
+Default weights: `KD_W=1.0`, `MSE_W=1.0`, `CE_W=1.0`
+
+Checkpoint saved to: `checkpoints/student.pt`
+
+### 5. Run Inference
+
+Generate text with the trained models:
 
 ```bash
-make infer PROMPT="Write a function"
-# or
-python infer.py \
-  --ae checkpoints/ae.pt \
-  --student checkpoints/student.pt \
-  --prompt "Write a short function" \
-  --max_new_tokens 128 \
-  --temperature 0.8
+make infer
 ```
 
-### 5. Start API Server
+Or with custom parameters:
 
 ```bash
-make serve PORT=7860
-# or
-uvicorn server:app --port 7860
+make infer PROMPT="Write a function to sort a list" MAX_TOKENS=128 TEMP=0.8
 ```
 
-API endpoint:
+### 6. Benchmark Performance
+
+Run throughput benchmarks:
+
+```bash
+make bench
+```
+
+This runs 5 prompts from `prompts.txt` and reports:
+- Latent steps per second
+- Decoded tokens per second
+- Compression ratio (K×)
+
+Results saved to: `results/bench_YYYYMMDD_HHMMSS.json`
+
+### 7. Start REST API Server
+
+Launch the FastAPI server:
+
+```bash
+make serve
+```
+
+Server runs on `http://localhost:7860` with:
+- **Swagger docs**: `http://localhost:7860/docs`
+- **Health check**: `GET /health`
+- **Generate endpoint**: `POST /generate`
+
+Example request:
 
 ```bash
 curl -X POST http://localhost:7860/generate \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Write a function",
-    "max_new_tokens": 128,
+    "prompt": "Write a Python function",
+    "max_new_tokens": 64,
     "temperature": 0.8,
     "top_p": 0.95
   }'
 ```
 
-### 6. Benchmark Performance
+## Testing
+
+### Run All Tests
 
 ```bash
-make bench
-# or
-python bench.py \
-  --ae checkpoints/ae.pt \
-  --student checkpoints/student.pt \
-  --max_new_tokens 128
+make test
 ```
+
+### Run Fast Unit Tests Only
+
+```bash
+make test-fast
+```
+
+Tests:
+- `test_env.py` - Environment and .env validation
+- `test_kd_api.py` - Venice API client (list_models, logprobs)
+- `test_pack.py` - Data packing (sequences are multiples of K)
+- `test_ae_unit.py` - Autoencoder forward, decode, no NaN/inf
+- `test_student_unit.py` - Student forward, optimizer step updates params
+
+### Run End-to-End Tests
+
+```bash
+make test-e2e
+```
+
+Tests:
+- `test_infer_e2e.py` - Inference returns non-empty, deterministic with seed
+- `test_server_e2e.py` - Server health, generate, 5 concurrent requests
+- `test_failure_modes.py` - Missing .env, bad key, bad URL, K validation
 
 ## Project Structure
 
 ```
 LatentForge/
-├── ae/                      # Autoencoder module
-│   ├── ae_model.py         # AE architecture
-│   ├── train_ae.py         # AE training script
-│   └── tokenizer_adapter.py # Tokenizer wrapper
-├── student/                 # Student model module
-│   ├── student_model.py    # Student architecture
-│   ├── train_student.py    # Student training with KD
-│   └── sampler.py          # Generation sampler
+├── ae/                      # Autoencoder
+│   ├── ae_model.py         # Model architecture
+│   ├── tokenizer_adapter.py # Tokenizer wrapper
+│   └── train_ae.py         # Training script
+├── student/                 # Student model
+│   ├── student_model.py    # Transformer architecture
+│   ├── sampler.py          # Generation sampler
+│   └── train_student.py    # Training with KD
 ├── kd/                      # Knowledge distillation
 │   ├── kd_client.py        # Venice API client
-│   └── kd_batcher.py       # Batch KD requests
+│   └── kd_batcher.py       # Batch processing
 ├── tools/                   # Utilities
-│   ├── data_packing.py     # Data preprocessing
-│   └── verify_api.py       # API verification
-├── configs/                 # YAML configurations
-│   ├── ae_default.yaml
-│   ├── student_default.yaml
-│   └── inference.yaml
+│   ├── verify_api.py       # API verification
+│   ├── make_toy_dataset.py # Toy data generation
+│   └── data_packing.py     # Data preprocessing
+├── tests/                   # Pytest test suite
+│   ├── test_env.py
+│   ├── test_kd_api.py
+│   ├── test_pack.py
+│   ├── test_ae_unit.py
+│   ├── test_student_unit.py
+│   ├── test_infer_e2e.py
+│   ├── test_server_e2e.py
+│   └── test_failure_modes.py
 ├── infer.py                 # CLI inference
-├── server.py                # FastAPI server
+├── server.py                # FastAPI REST server
 ├── bench.py                 # Benchmarking tool
 ├── Makefile                 # Automation targets
 ├── requirements.txt         # Python dependencies
-├── .env                     # API credentials (do not commit)
+├── prompts.txt              # Benchmark prompts
+├── .env                     # API credentials (DO NOT COMMIT)
 └── README_local.md          # This file
 ```
 
@@ -212,118 +274,180 @@ LatentForge/
 
 ### Autoencoder Parameters
 
-- `k`: Compression factor (default: 8)
-- `latent_dim`: Latent vector dimension (default: 1024)
-- `embed_dim`: Token embedding dimension (default: 768)
-- `num_layers`: Number of transformer layers (default: 4)
+- `K=8` - Compression factor (tokens per latent)
+- `D=1024` - Latent dimension
+- `EPOCHS=10` - Training epochs
+- Target: ≥99.5% exact reconstruction
 
 ### Student Parameters
 
-- `latent_dim`: Must match AE (default: 1024)
-- `hidden_dim`: Hidden dimension (default: 2048)
-- `num_layers`: Number of layers (default: 12)
-- `seq_len`: Sequence length in latents (default: 64)
+- `KD_W=1.0` - Knowledge distillation weight
+- `MSE_W=1.0` - MSE in latent space weight
+- `CE_W=1.0` - Cross-entropy on tokens weight
+- `STEPS=50` - Training steps for smoke test
 
-### Loss Weights
+### Sampling Parameters
 
-- `kd_w`: Knowledge distillation weight (default: 1.0)
-- `mse_w`: MSE in latent space weight (default: 1.0)
-- `ce_w`: Cross-entropy on tokens weight (default: 1.0)
+- `temperature` - Sampling temperature (0.0 = greedy, higher = more random)
+- `top_p` - Nucleus sampling threshold
+- `top_k` - Top-k sampling (0 = disabled)
+- `seed` - Random seed for reproducibility
 
 ## Makefile Targets
 
 ```bash
 make help          # Show all targets
-make setup         # Setup environment
+make setup         # Setup environment and install deps
 make check-api     # Verify Venice API
+make toy           # Create toy dataset
 make train-ae      # Train autoencoder
 make train-student # Train student with KD
 make infer         # Run inference
 make serve         # Start FastAPI server
 make bench         # Run benchmark
+make test          # Run all tests
+make test-fast     # Run fast unit tests
+make test-e2e      # Run end-to-end tests
 make clean         # Clean generated files
 ```
 
-## Venice API Documentation
+## Smoke Test Sequence
+
+Run these commands in order to verify the complete pipeline:
+
+```bash
+# 1. Setup
+make setup
+source .venv/bin/activate
+
+# 2. Verify API
+make check-api
+
+# 3. Create toy data
+make toy
+
+# 4. Train AE
+make train-ae
+
+# 5. Train student
+make train-student
+
+# 6. Run inference
+make infer
+
+# 7. Run benchmark
+make bench
+
+# 8. Run tests
+pytest -q -k "env or kd_api or pack or ae_unit or student_unit"
+pytest -q -k "infer_e2e" --timeout=120
+pytest -q -k "server_e2e" --timeout=120
+```
+
+## Acceptance Criteria
+
+✅ **API Verification**: `check-api` finds `qwen3-next-80b` with logprobs support
+✅ **Toy Run**: Train AE and student, infer works end-to-end
+✅ **Benchmark**: Writes `results/bench_*.json` and prints table
+✅ **Tests Pass**: Unit and e2e tests pass with trained models
+✅ **Documentation**: README matches working commands
+
+## References
+
+### Venice AI Documentation
 
 - **Getting Started**: https://docs.venice.ai/overview/getting-started
-- **Models List**: https://docs.venice.ai/api-reference/endpoint/models/list
+- **Models List API**: https://docs.venice.ai/api-reference/endpoint/models/list
 - **Chat Completions**: https://docs.venice.ai/api-reference/endpoint/chat/completions
 - **Available Models**: https://docs.venice.ai/overview/models
 
-## Related Work
-
 ### CALM (Confident Adaptive Language Modeling)
-
-CALM enables early exiting in language models by learning when to stop computation.
 
 - **Paper**: https://arxiv.org/abs/2207.07061
 - **Repository**: https://github.com/shaochenze/calm
 
-LatentForge extends CALM's ideas by:
+CALM enables early exiting in language models. LatentForge extends this by:
 - Operating in latent space instead of token space
-- Using knowledge distillation from a teacher model
-- Achieving K× speedup through compression
+- Using knowledge distillation from a powerful teacher
+- Achieving K× speedup through token compression
 
 ### Qwen Models
 
-Qwen 3 Next 80B is used as the frozen teacher model via Venice API.
-
-- **Model Card**: https://huggingface.co/Qwen
-- **Venice Integration**: https://docs.venice.ai/overview/models
-
-## Acceptance Criteria
-
-✅ API verification passes and shows `qwen3-next-80b` available
-✅ AE achieves ≥99.5% exact reconstruction on validation for K=8
-✅ Student generates end-to-end via latent steps without errors
-✅ Benchmark shows ~K× fewer AR steps than token LLM
+- **Hugging Face**: https://huggingface.co/Qwen
+- **Model Cards**: Qwen 3 Next series documentation
 
 ## Troubleshooting
 
-### Venice API Issues
+### Venice API Errors
 
-```bash
-# Test API manually
-curl -H "Authorization: Bearer $VENICE_API_KEY" \
-  "$VENICE_BASE_URL/models"
-```
+**401 Unauthorized**:
+- Check `VENICE_API_KEY` in `.env`
+- Verify key is valid and not expired
 
-### CUDA Out of Memory
+**Connection Errors**:
+- Check `VENICE_BASE_URL` is correct
+- Verify internet connectivity
+- Check for firewall/proxy issues
 
-- Reduce `batch_size`
-- Use `--bf16` for mixed precision
-- Reduce `seq_len` for student training
+**429 Rate Limiting**:
+- KD client has exponential backoff (max 32s)
+- Reduce batch size or add delays
 
-### Low Reconstruction Accuracy
+### Training Issues
 
-- Increase `epochs` for AE training
-- Increase `num_layers` in AE
-- Reduce `l2_weight`
+**CUDA Out of Memory**:
+- Reduce `BATCH_SIZE`
+- Use `--bf16` flag (already default)
+- Reduce `seq_len` or `latent_dim`
 
-## Performance Tips
+**Low AE Reconstruction**:
+- Increase `EPOCHS` (try 10-20)
+- Increase `num_layers` in ae_model.py
+- Check data quality
 
-1. **Use BF16**: Add `--bf16` flag for 2× faster training
-2. **Batch Size**: Increase until OOM for better GPU utilization
-3. **Data Quality**: Clean, diverse data improves results
-4. **K Parameter**: Start with K=8, experiment with 4, 16, 32
+**Student Not Learning**:
+- Verify AE is trained first
+- Check loss weights balance
+- Increase training steps
+
+### Test Failures
+
+**test_kd_api timeout**:
+- Venice API may be slow
+- Increase timeout or skip with `--timeout=180`
+
+**test_infer_e2e not found**:
+- Need trained checkpoints first
+- Run `make train-ae` and `make train-student`
+
+**test_server_e2e fails**:
+- Port 7861 may be in use
+- Kill existing servers: `pkill -f uvicorn`
 
 ## Development
-
-### Running Tests
-
-```bash
-make test-tokenizer  # Test tokenizer
-make test-ae         # Test autoencoder
-make test-student    # Test student model
-make test-kd         # Test KD client
-```
 
 ### Code Style
 
 - Type hints everywhere
-- Dataclasses for configuration
+- Dataclasses for configurations
 - Docstrings for public APIs
+- F-strings for formatting
+
+### Adding New Features
+
+1. Write tests first (`tests/test_*.py`)
+2. Implement feature
+3. Update Makefile if needed
+4. Update this README
+5. Run full test suite
+
+### Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make changes with tests
+4. Ensure all tests pass
+5. Submit pull request
 
 ## License
 
@@ -331,11 +455,9 @@ MIT
 
 ## Citation
 
-If you use LatentForge in your research, please cite:
-
 ```bibtex
 @software{latentforge2025,
-  title={LatentForge: Latent-Space Autoregressive Language Modeling},
+  title={LatentForge: CALM-Style Latent-Vector AR Model with KD},
   author={Your Name},
   year={2025},
   url={https://github.com/jhacksman/LatentForge}
@@ -344,6 +466,6 @@ If you use LatentForge in your research, please cite:
 
 ## Acknowledgments
 
-- Venice AI for API access to Qwen 3 Next 80B
-- CALM paper for inspiration
-- Qwen team for the teacher model
+- **Venice AI** for API access to Qwen 3 Next 80B
+- **CALM paper** for architectural inspiration
+- **Qwen team** for the teacher model

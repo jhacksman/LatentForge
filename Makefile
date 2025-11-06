@@ -1,23 +1,29 @@
-.PHONY: help setup check-api train-ae train-student infer serve bench clean
+.PHONY: help setup check-api toy train-ae train-student infer serve bench test test-fast test-e2e clean
 
 # Default target
 help:
 	@echo "LatentForge - Makefile targets:"
 	@echo ""
-	@echo "  setup           - Create venv, install dependencies, create basic config"
+	@echo "  setup           - Create venv and install dependencies"
 	@echo "  check-api       - Verify Venice API connection"
-	@echo "  train-ae        - Train autoencoder (use K=8 D=1024 EPOCHS=10)"
+	@echo "  toy             - Create toy dataset and pack it"
+	@echo "  train-ae        - Train autoencoder"
 	@echo "  train-student   - Train student with KD"
 	@echo "  infer           - Run inference"
 	@echo "  serve           - Start FastAPI server"
 	@echo "  bench           - Run benchmark"
+	@echo "  test            - Run all tests"
+	@echo "  test-fast       - Run fast unit tests only"
+	@echo "  test-e2e        - Run end-to-end tests"
 	@echo "  clean           - Clean generated files"
 	@echo ""
 	@echo "Example usage:"
 	@echo "  make setup"
 	@echo "  make check-api"
-	@echo "  make train-ae K=8 D=1024 EPOCHS=2"
+	@echo "  make toy"
+	@echo "  make train-ae"
 	@echo "  make train-student"
+	@echo "  make infer"
 	@echo ""
 
 # Setup environment
@@ -27,11 +33,11 @@ setup:
 	@echo ""
 	@echo "✅ Virtual environment created"
 	@echo ""
-	@echo "To activate:"
-	@echo "  source .venv/bin/activate"
+	@echo "Activating and installing dependencies..."
+	.venv/bin/pip install --upgrade pip
+	.venv/bin/pip install torch transformers==4.43.0 accelerate fastapi uvicorn pydantic requests python-dotenv pytest pytest-timeout httpx tabulate rich
 	@echo ""
-	@echo "Then install dependencies:"
-	@echo "  pip install -r requirements.txt"
+	@echo "✅ Dependencies installed"
 	@echo ""
 	@if [ ! -f .env ]; then \
 		echo "⚠️  .env file not found. Please create it with your Venice API credentials."; \
@@ -40,18 +46,28 @@ setup:
 	fi
 	@mkdir -p checkpoints results data configs
 	@echo "✅ Directories created"
+	@echo ""
+	@echo "Setup complete! Activate with:"
+	@echo "  source .venv/bin/activate"
 
 # Verify API
 check-api:
 	@echo "Verifying Venice API..."
 	python tools/verify_api.py
 
+# Create toy dataset
+toy:
+	@echo "Creating toy dataset..."
+	python tools/make_toy_dataset.py
+	@echo "Packing toy dataset..."
+	python tools/data_packing.py --input ./data/toy.jsonl --output ./data/packed_toy --seq_len 2048 --k 8
+
 # Train autoencoder
-# Usage: make train-ae K=8 D=1024 EPOCHS=10 DATA=/path/to/data
+# Usage: make train-ae K=8 D=1024 EPOCHS=1
 K ?= 8
 D ?= 1024
-EPOCHS ?= 10
-DATA ?= data/packed/train
+EPOCHS ?= 1
+DATA ?= ./data/packed_toy/train
 BATCH_SIZE ?= 32
 
 train-ae:
@@ -73,7 +89,7 @@ train-ae:
 KD_W ?= 1.0
 MSE_W ?= 1.0
 CE_W ?= 1.0
-STUDENT_EPOCHS ?= 5
+STEPS ?= 50
 AE_CKPT ?= checkpoints/ae.pt
 
 train-student:
@@ -82,6 +98,7 @@ train-student:
 	@echo "  KD weight=$(KD_W)"
 	@echo "  MSE weight=$(MSE_W)"
 	@echo "  CE weight=$(CE_W)"
+	@echo "  Steps=$(STEPS)"
 	python student/train_student.py \
 		--data $(DATA) \
 		--ae_ckpt $(AE_CKPT) \
@@ -90,15 +107,15 @@ train-student:
 		--kd_w $(KD_W) \
 		--mse_w $(MSE_W) \
 		--ce_w $(CE_W) \
-		--epochs $(STUDENT_EPOCHS) \
-		--use_kd \
+		--epochs 1 \
 		--bf16
 
 # Inference
-PROMPT ?= "Write a short function"
-MAX_TOKENS ?= 128
+PROMPT ?= "Smoke test"
+MAX_TOKENS ?= 32
 TEMP ?= 0.8
 TOP_P ?= 0.95
+SEED ?= 0
 STUDENT_CKPT ?= checkpoints/student.pt
 
 infer:
@@ -109,24 +126,37 @@ infer:
 		--prompt "$(PROMPT)" \
 		--max_new_tokens $(MAX_TOKENS) \
 		--temperature $(TEMP) \
-		--top_p $(TOP_P)
+		--top_p $(TOP_P) \
+		--seed $(SEED)
 
 # Serve
 PORT ?= 7860
 serve:
 	@echo "Starting FastAPI server on port $(PORT)..."
-	python server.py \
-		--port $(PORT) \
-		--ae $(AE_CKPT) \
-		--student $(STUDENT_CKPT)
+	uvicorn server:app --port $(PORT)
 
 # Benchmark
+PROMPTS_FILE ?= prompts.txt
 bench:
 	@echo "Running benchmark..."
 	python bench.py \
 		--ae $(AE_CKPT) \
 		--student $(STUDENT_CKPT) \
-		--max_new_tokens 128
+		--prompts $(PROMPTS_FILE) \
+		--k $(K)
+
+# Tests
+test:
+	@echo "Running all tests..."
+	pytest -q
+
+test-fast:
+	@echo "Running fast unit tests..."
+	pytest -q -k "unit or env or kd_api or pack" --maxfail=1
+
+test-e2e:
+	@echo "Running end-to-end tests..."
+	pytest -q -k "e2e" --timeout=120
 
 # Clean
 clean:
@@ -135,6 +165,7 @@ clean:
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
 	find . -type f -name "*.pyo" -delete 2>/dev/null || true
 	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name ".pytest_cache" -exec rm -rf {} + 2>/dev/null || true
 	@echo "✅ Cleaned"
 
 # Development helpers

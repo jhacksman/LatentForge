@@ -12,6 +12,12 @@ import torch
 
 from student.sampler import LatentSampler, load_models
 
+try:
+    from tabulate import tabulate
+    HAS_TABULATE = True
+except ImportError:
+    HAS_TABULATE = False
+
 
 # Default benchmark prompts
 DEFAULT_PROMPTS = [
@@ -173,6 +179,25 @@ def print_summary(results: Dict):
 
     print(f"\n{'='*60}\n")
 
+    # Print table of results
+    if HAS_TABULATE:
+        print("Per-Prompt Results:")
+        table_data = []
+        for prompt_result in results["prompts"]:
+            prompt_short = prompt_result["prompt"][:40] + "..." if len(prompt_result["prompt"]) > 40 else prompt_result["prompt"]
+            table_data.append([
+                prompt_short,
+                f"{prompt_result['avg_latent_steps_per_sec']:.2f}",
+                f"{prompt_result['avg_tokens_per_sec']:.2f}",
+            ])
+
+        headers = ["Prompt", "Latent Steps/s", "Tokens/s"]
+        print(tabulate(table_data, headers=headers, tablefmt="grid"))
+        print()
+    else:
+        print("(Install 'tabulate' for formatted tables)")
+        print()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark LatentForge")
@@ -206,8 +231,20 @@ def main():
         device=device,
     )
 
-    # Prompts
-    prompts = args.prompts if args.prompts else DEFAULT_PROMPTS
+    # Prompts - check if it's a file path
+    if args.prompts:
+        # Check if first argument is a file
+        if len(args.prompts) == 1 and Path(args.prompts[0]).exists():
+            prompts_file = Path(args.prompts[0])
+            print(f"Loading prompts from: {prompts_file}")
+            with open(prompts_file, "r") as f:
+                prompts = [line.strip() for line in f if line.strip()]
+        else:
+            prompts = args.prompts
+    else:
+        prompts = DEFAULT_PROMPTS
+
+    print(f"Benchmarking {len(prompts)} prompts")
 
     # Run benchmark
     results = benchmark_generation(

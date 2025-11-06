@@ -7,6 +7,7 @@ import argparse
 from typing import Optional
 import torch
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -38,6 +39,15 @@ app = FastAPI(
     title="LatentForge API",
     description="Text generation with latent autoregressive models",
     version="1.0.0",
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 sampler: Optional[LatentSampler] = None

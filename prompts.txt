@@ -1,0 +1,5 @@
+Write a function to calculate fibonacci numbers
+Explain the concept of neural networks in simple terms
+Create a recipe for chocolate chip cookies
+Describe the process of photosynthesis
+Write a short story about a robot learning to paint
