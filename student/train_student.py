@@ -21,7 +21,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from student.student_model import StudentTransformer
 from ae.ae_model import LatentAutoencoder
 from ae.tokenizer_adapter import TokenizerAdapter
-from kd.kd_client import VeniceKDClient
+from kd.kd_client import KDClient
 
 
 class LatentDataset(Dataset):
@@ -113,7 +113,7 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    kd_client: VeniceKDClient,
+    kd_client: KDClient,
     tokenizer: TokenizerAdapter,
     kd_weight: float = 1.0,
     mse_weight: float = 1.0,
@@ -332,7 +332,8 @@ def main():
     kd_client = None
     if args.use_kd:
         print("Initializing KD client...")
-        kd_client = VeniceKDClient()
+        kd_client = KDClient()
+        print(f"Using teacher backend: {kd_client.backend_type}")
 
     # Data
     print("Loading data...")
@@ -420,6 +421,11 @@ def main():
             print(f"✅ Saved checkpoint: {checkpoint_path}")
 
     csv_file.close()
+
+    # Print KD cache statistics
+    if kd_client:
+        kd_client.print_cache_stats()
+
     print(f"\n🎉 Training complete!")
     print(f"Best loss: {best_loss:.4f}")
     print(f"Metrics saved to {csv_path}")
