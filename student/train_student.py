@@ -18,6 +18,13 @@ import json
 
 sys.path.append(str(Path(__file__).parent.parent))
 
+# Optional DeepSpeed import
+try:
+    import deepspeed
+    DEEPSPEED_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_AVAILABLE = False
+
 from student.student_model import StudentTransformer
 from ae.ae_model import LatentAutoencoder
 from ae.tokenizer_adapter import TokenizerAdapter
@@ -121,14 +128,21 @@ def train_epoch(
     use_kd: bool = True,
     gradient_accumulation_steps: int = 1,
     use_activation_checkpointing: bool = False,
+    use_deepspeed: bool = False,
 ) -> dict:
     """Train for one epoch."""
-    student.train()
-    autoencoder.eval()  # Freeze autoencoder
+    # Check if student is DeepSpeed engine
+    is_deepspeed_engine = hasattr(student, "backward") and hasattr(student, "step")
 
-    # Enable activation checkpointing if requested
-    if use_activation_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
-        student.gradient_checkpointing_enable()
+    if is_deepspeed_engine:
+        student.train()
+    else:
+        student.train()
+        autoencoder.eval()  # Freeze autoencoder
+
+        # Enable activation checkpointing if requested
+        if use_activation_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
+            student.gradient_checkpointing_enable()
 
     total_loss = 0.0
     total_metrics = {
@@ -153,8 +167,8 @@ def train_epoch(
             latents = latents.reshape(batch_size, seq_len, -1)  # (batch_size, seq_len, latent_dim)
 
         # Student forward: predict next latent
-        # Zero gradients at the start of accumulation cycle
-        if accumulation_counter % gradient_accumulation_steps == 0:
+        # Zero gradients at the start of accumulation cycle (not needed for DeepSpeed)
+        if not is_deepspeed_engine and accumulation_counter % gradient_accumulation_steps == 0:
             optimizer.zero_grad()
 
         # Input: latents[:-1], Target: latents[1:]
@@ -268,17 +282,21 @@ def train_epoch(
             ce_weight * ce_loss + mse_weight * mse_loss + kd_weight * kd_loss
         )
 
-        # Scale loss for gradient accumulation
-        scaled_loss = total_loss_batch / gradient_accumulation_steps
+        # Backward and optimizer step
+        if is_deepspeed_engine:
+            # DeepSpeed handles gradient accumulation internally
+            student.backward(total_loss_batch)
+            student.step()
+        else:
+            # Manual gradient accumulation
+            scaled_loss = total_loss_batch / gradient_accumulation_steps
+            scaled_loss.backward()
 
-        # Backward
-        scaled_loss.backward()
-
-        # Step optimizer every gradient_accumulation_steps
-        accumulation_counter += 1
-        if accumulation_counter % gradient_accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-            optimizer.step()
+            # Step optimizer every gradient_accumulation_steps
+            accumulation_counter += 1
+            if accumulation_counter % gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+                optimizer.step()
 
         # Accumulate metrics (use original unscaled loss for reporting)
         total_loss += total_loss_batch.item()
@@ -327,6 +345,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Checkpoint dir")
     parser.add_argument("--config", type=str, help="Config file (YAML)")
+    parser.add_argument("--deepspeed", action="store_true", help="Enable DeepSpeed training")
+    parser.add_argument("--deepspeed_config", type=str, default="configs/deepspeed_gb10.json", help="DeepSpeed config file")
+    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
     args = parser.parse_args()
 
     # Load config
@@ -389,20 +410,41 @@ def main():
     # Data
     print("Loading data...")
     train_dataset = LatentDataset(args.data, args.k, args.seq_len)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-    )
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr)
+    # DeepSpeed initialization
+    use_deepspeed = args.deepspeed and DEEPSPEED_AVAILABLE
+    if args.deepspeed and not DEEPSPEED_AVAILABLE:
+        print("WARNING: DeepSpeed requested but not available. Install with: pip install deepspeed")
+        print("Falling back to standard training...")
+        use_deepspeed = False
+
+    if use_deepspeed:
+        print(f"Initializing DeepSpeed with config: {args.deepspeed_config}")
+
+        # DeepSpeed handles dataloader internally
+        model_engine, optimizer, train_loader, _ = deepspeed.initialize(
+            args=args,
+            model=student,
+            model_parameters=student.parameters(),
+            training_data=train_dataset,
+            config=args.deepspeed_config,
+        )
+        print(f"DeepSpeed initialized (ZeRO stage: {model_engine.zero_optimization_stage()})")
+        student = model_engine  # Replace student with engine
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+        )
+        optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr)
 
     # Training
     print(f"\nTraining for {args.epochs} epochs...")
-    print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
-    print(f"Activation checkpointing: {args.use_activation_checkpointing}")
+    if not use_deepspeed:
+        print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
+        print(f"Activation checkpointing: {args.use_activation_checkpointing}")
     best_loss = float("inf")
 
     # CSV logging
@@ -436,6 +478,7 @@ def main():
             use_kd=args.use_kd,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             use_activation_checkpointing=args.use_activation_checkpointing,
+            use_deepspeed=use_deepspeed,
         )
 
         print(f"\nTrain metrics:")
@@ -451,25 +494,33 @@ def main():
 
         # Save checkpoint
         os.makedirs(args.checkpoint_dir, exist_ok=True)
-        checkpoint_path = Path(args.checkpoint_dir) / "student.pt"
 
         if train_metrics["loss"] < best_loss:
             best_loss = train_metrics["loss"]
-            torch.save(
-                {
-                    "model": student.state_dict(),
-                    "config": {
-                        "latent_dim": args.latent_dim,
-                        "hidden_dim": args.hidden_dim,
-                        "num_layers": args.num_layers,
-                        "max_seq_len": args.seq_len,
+
+            if use_deepspeed:
+                # DeepSpeed checkpoint saving
+                checkpoint_path = Path(args.checkpoint_dir) / f"student_epoch{epoch}"
+                student.save_checkpoint(args.checkpoint_dir, f"student_epoch{epoch}")
+                print(f"✅ Saved DeepSpeed checkpoint: {checkpoint_path}")
+            else:
+                # Standard PyTorch checkpoint
+                checkpoint_path = Path(args.checkpoint_dir) / "student.pt"
+                torch.save(
+                    {
+                        "model": student.state_dict(),
+                        "config": {
+                            "latent_dim": args.latent_dim,
+                            "hidden_dim": args.hidden_dim,
+                            "num_layers": args.num_layers,
+                            "max_seq_len": args.seq_len,
+                        },
+                        "metrics": train_metrics,
+                        "epoch": epoch,
                     },
-                    "metrics": train_metrics,
-                    "epoch": epoch,
-                },
-                checkpoint_path,
-            )
-            print(f"✅ Saved checkpoint: {checkpoint_path}")
+                    checkpoint_path,
+                )
+                print(f"✅ Saved checkpoint: {checkpoint_path}")
 
     csv_file.close()
 

@@ -1,4 +1,4 @@
-.PHONY: help setup check-api toy train-ae train-student train-student-venice train-student-vllm-local train-student-vllm-remote serve-vllm-local infer serve bench test test-fast test-e2e clean
+.PHONY: help setup check-api toy train-ae train-student train-student-venice train-student-vllm-local train-student-vllm-remote train-student-deepspeed train-student-deepspeed-zero3 serve-vllm-local infer serve bench test test-fast test-e2e clean
 
 # Default target
 help:
@@ -15,6 +15,8 @@ help:
 	@echo "  train-student-venice       - Train with Venice API teacher"
 	@echo "  train-student-vllm-local   - Train with local vLLM teacher"
 	@echo "  train-student-vllm-remote  - Train with remote vLLM teacher"
+	@echo "  train-student-deepspeed    - Train with DeepSpeed ZeRO-2"
+	@echo "  train-student-deepspeed-zero3 - Train with DeepSpeed ZeRO-3"
 	@echo ""
 	@echo "vLLM Teacher:"
 	@echo "  serve-vllm-local           - Start local vLLM teacher server"
@@ -136,6 +138,41 @@ train-student-vllm-local:
 train-student-vllm-remote:
 	@echo "Training student with remote vLLM teacher..."
 	TEACHER_BACKEND=vllm-remote $(MAKE) train-student
+
+# DeepSpeed training targets
+DEEPSPEED_CONFIG ?= configs/deepspeed_gb10.json
+
+train-student-deepspeed:
+	@echo "Training student with DeepSpeed ZeRO-2..."
+	python student/train_student.py \
+		--data $(DATA) \
+		--ae_ckpt $(AE_CKPT) \
+		--k $(K) \
+		--latent_dim $(D) \
+		--kd_w $(KD_W) \
+		--mse_w $(MSE_W) \
+		--ce_w $(CE_W) \
+		--epochs 1 \
+		--bf16 \
+		--deepspeed \
+		--deepspeed_config configs/deepspeed_gb10.json \
+		--use_kd
+
+train-student-deepspeed-zero3:
+	@echo "Training student with DeepSpeed ZeRO-3..."
+	python student/train_student.py \
+		--data $(DATA) \
+		--ae_ckpt $(AE_CKPT) \
+		--k $(K) \
+		--latent_dim $(D) \
+		--kd_w $(KD_W) \
+		--mse_w $(MSE_W) \
+		--ce_w $(CE_W) \
+		--epochs 1 \
+		--bf16 \
+		--deepspeed \
+		--deepspeed_config configs/deepspeed_gb10_zero3.json \
+		--use_kd
 
 # vLLM teacher server
 serve-vllm-local:
