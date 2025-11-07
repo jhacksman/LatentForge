@@ -188,10 +188,16 @@ def train_epoch(
             num_kd_samples = min(2, batch_size)
             kd_indices = torch.randperm(batch_size)[:num_kd_samples]
 
+            kd_losses = []
             for kd_idx in kd_indices:
-                # Get target chunk
+                # Get target chunk and corresponding predicted logits
                 target_chunk = target_chunks[kd_idx, 0, :].cpu()  # First position only
-                prompt_text = tokenizer.decode(target_chunk, skip_special_tokens=True)
+                predicted_logits_chunk = decoded_logits[kd_idx, :, :]  # (k, vocab_size)
+
+                # Build prompt from previous context
+                # Use the input chunk as context
+                context_chunk = chunks[kd_idx, 0, :].cpu()
+                prompt_text = tokenizer.decode(context_chunk, skip_special_tokens=True)
 
                 try:
                     # Get teacher distribution
@@ -199,18 +205,63 @@ def train_epoch(
                         prompt=prompt_text,
                         max_tokens=k,
                         temperature=1.0,
+                        top_logprobs=20,
                     )
 
-                    # Convert teacher probs to tensor
-                    # This is simplified; in practice, align tokens
-                    # For now, skip KD if we can't align
+                    # Align teacher tokens with student vocabulary and compute KL
                     if len(teacher_output.normalized_probs) > 0:
-                        # Placeholder: just add a small penalty
-                        # Full implementation would align tokens and compute proper KL
-                        pass
+                        position_kls = []
+
+                        for pos in range(min(k, len(teacher_output.normalized_probs))):
+                            teacher_probs_dict = teacher_output.normalized_probs[pos]
+
+                            if not teacher_probs_dict:
+                                continue
+
+                            # Create teacher distribution tensor (sparse)
+                            teacher_dist = torch.zeros(predicted_logits_chunk.shape[1], device=device)
+
+                            for token_str, prob in teacher_probs_dict.items():
+                                # Encode teacher token to get ID
+                                token_ids = tokenizer.encode(token_str, add_special_tokens=False)
+                                if len(token_ids) > 0:
+                                    token_id = token_ids[0]
+                                    if token_id < teacher_dist.shape[0]:
+                                        teacher_dist[token_id] = prob
+
+                            # Normalize teacher distribution (sparse top-k)
+                            teacher_dist_sum = teacher_dist.sum()
+                            if teacher_dist_sum > 0:
+                                teacher_dist = teacher_dist / teacher_dist_sum
+                            else:
+                                continue
+
+                            # Student distribution for this position
+                            student_logits = predicted_logits_chunk[pos, :]
+                            student_log_probs = F.log_softmax(student_logits, dim=-1)
+
+                            # KL divergence: sum(teacher * log(teacher / student))
+                            # = sum(teacher * (log(teacher) - log(student)))
+                            # For numerical stability with sparse teacher:
+                            teacher_nonzero = teacher_dist > 0
+                            if teacher_nonzero.any():
+                                kl_pos = (
+                                    teacher_dist[teacher_nonzero] *
+                                    (torch.log(teacher_dist[teacher_nonzero]) - student_log_probs[teacher_nonzero])
+                                ).sum()
+                                position_kls.append(kl_pos)
+
+                        # Average KL over positions in this chunk
+                        if position_kls:
+                            chunk_kl = torch.stack(position_kls).mean()
+                            kd_losses.append(chunk_kl)
 
                 except Exception as e:
                     print(f"\nKD request failed: {e}")
+
+            # Average KL over samples
+            if kd_losses:
+                kd_loss = torch.stack(kd_losses).mean()
 
         # Total loss
         total_loss_batch = (
