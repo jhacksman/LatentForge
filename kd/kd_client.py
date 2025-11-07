@@ -34,6 +34,7 @@ class KDClient:
         backend_type: Optional[str] = None,
         cache_dir: Optional[str] = None,
         enable_cache: bool = True,
+        cache_ttl_days: int = 30,  # Cache expiry in days
         **backend_kwargs,
     ):
         """
@@ -44,12 +45,14 @@ class KDClient:
                          Defaults to TEACHER_BACKEND env var
             cache_dir: Directory for KD cache (default: ./cache)
             enable_cache: Enable KD caching
+            cache_ttl_days: Cache TTL in days (default: 30)
             **backend_kwargs: Additional arguments for backend initialization
         """
         load_dotenv()
 
         # Determine backend type
         self.backend_type = backend_type or os.getenv("TEACHER_BACKEND", "venice")
+        self.cache_ttl_days = cache_ttl_days
 
         # Initialize backend
         print(f"Initializing KD client with backend: {self.backend_type}")
@@ -105,20 +108,54 @@ class KDClient:
         print(f"✅ KD client initialized with async prefetch and adaptive load handling")
 
     def _init_cache_db(self):
-        """Initialize SQLite cache database."""
+        """Initialize SQLite cache database with TTL support."""
         conn = sqlite3.connect(self.cache_db_path)
         cursor = conn.cursor()
 
+        # Create cache table with additional metadata
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS kd_cache (
                 cache_key TEXT PRIMARY KEY,
                 teacher_output TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                backend_type TEXT NOT NULL,
+                model_id TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                access_count INTEGER DEFAULT 1,
+                last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+
+        # Create index for efficient TTL cleanup
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON kd_cache(timestamp)
         """)
 
         conn.commit()
         conn.close()
+
+        # Clean expired entries on init
+        self._cleanup_expired_cache()
+
+    def _cleanup_expired_cache(self):
+        """Remove cache entries older than TTL."""
+        try:
+            conn = sqlite3.connect(self.cache_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                DELETE FROM kd_cache
+                WHERE julianday('now') - julianday(timestamp) > ?
+            """, (self.cache_ttl_days,))
+
+            deleted_count = cursor.rowcount
+            if deleted_count > 0:
+                print(f"🧹 Cleaned {deleted_count} expired cache entries (>{self.cache_ttl_days} days old)")
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            print(f"Cache cleanup error: {e}")
 
     def _get_cache_key(
         self,
@@ -131,6 +168,14 @@ class KDClient:
         """
         Generate cache key for request.
 
+        Cache key includes:
+        - Backend type (venice, vllm-local, vllm-remote)
+        - Model ID (for version tracking)
+        - Quantization type (affects output distributions)
+        - All request parameters
+
+        This ensures cache invalidation when model or backend changes.
+
         Args:
             messages: Message list
             max_tokens: Max tokens
@@ -141,21 +186,33 @@ class KDClient:
         Returns:
             Cache key (SHA256 hash)
         """
-        # Include backend type and all params in key
+        # Get model ID based on backend
+        model_id = None
+        if self.backend_type == "venice":
+            model_id = os.getenv("VENICE_MODEL", "qwen3-next-80b")
+        elif self.backend_type in ["vllm-local", "vllm-remote"]:
+            model_id = os.getenv("VLLM_LOCAL_MODEL", "Qwen/Qwen3-Next-80B-A3B-Instruct")
+            # Include quantization in key for vLLM
+            quantization = os.getenv("VLLM_QUANTIZATION", "gptq")
+            model_id = f"{model_id}:{quantization}"
+
+        # Include backend type and model in key
         key_data = {
             "backend": self.backend_type,
+            "model_id": model_id,
             "messages": messages,
             "max_tokens": max_tokens,
             "top_logprobs": top_logprobs,
             "temperature": temperature,
             "top_p": top_p,
+            "cache_version": "v2",  # Increment when changing cache format
         }
 
         key_str = json.dumps(key_data, sort_keys=True)
         return hashlib.sha256(key_str.encode()).hexdigest()
 
     def _get_from_cache(self, cache_key: str) -> Optional[TeacherOutput]:
-        """Get cached output."""
+        """Get cached output and update access stats."""
         if not self.enable_cache:
             return None
 
@@ -169,12 +226,22 @@ class KDClient:
             )
 
             row = cursor.fetchone()
-            conn.close()
 
             if row:
                 self.cache_hits += 1
+
+                # Update access stats
+                cursor.execute("""
+                    UPDATE kd_cache
+                    SET access_count = access_count + 1,
+                        last_accessed = CURRENT_TIMESTAMP
+                    WHERE cache_key = ?
+                """, (cache_key,))
+                conn.commit()
+
                 # Deserialize
                 data = json.loads(row[0])
+                conn.close()
                 return TeacherOutput(
                     tokens=data["tokens"],
                     logprobs=data["logprobs"],
@@ -182,6 +249,7 @@ class KDClient:
                 )
             else:
                 self.cache_misses += 1
+                conn.close()
                 return None
 
         except Exception as e:
@@ -190,7 +258,7 @@ class KDClient:
             return None
 
     def _save_to_cache(self, cache_key: str, output: TeacherOutput):
-        """Save output to cache."""
+        """Save output to cache with metadata."""
         if not self.enable_cache:
             return
 
@@ -202,13 +270,21 @@ class KDClient:
                 "normalized_probs": output.normalized_probs,
             }
 
+            # Get model ID for metadata
+            model_id = None
+            if self.backend_type == "venice":
+                model_id = os.getenv("VENICE_MODEL", "qwen3-next-80b")
+            elif self.backend_type in ["vllm-local", "vllm-remote"]:
+                model_id = os.getenv("VLLM_LOCAL_MODEL", "Qwen/Qwen3-Next-80B-A3B-Instruct")
+
             conn = sqlite3.connect(self.cache_db_path)
             cursor = conn.cursor()
 
-            cursor.execute(
-                "INSERT OR REPLACE INTO kd_cache (cache_key, teacher_output) VALUES (?, ?)",
-                (cache_key, json.dumps(data))
-            )
+            cursor.execute("""
+                INSERT OR REPLACE INTO kd_cache
+                (cache_key, teacher_output, backend_type, model_id)
+                VALUES (?, ?, ?, ?)
+            """, (cache_key, json.dumps(data), self.backend_type, model_id))
 
             conn.commit()
             conn.close()
