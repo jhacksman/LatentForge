@@ -196,6 +196,7 @@ def train_epoch(
         )
 
         # Loss 3: KD from teacher (optional, sparse for efficiency)
+        # CRITICAL: Use teacher tokenizer for proper alignment
         kd_loss = torch.tensor(0.0, device=device)
         if use_kd and kd_weight > 0 and batch_idx % 10 == 0:  # Only every 10 batches
             # Sample a few examples for KD
@@ -204,17 +205,15 @@ def train_epoch(
 
             kd_losses = []
             for kd_idx in kd_indices:
-                # Get target chunk and corresponding predicted logits
-                target_chunk = target_chunks[kd_idx, 0, :].cpu()  # First position only
+                # Get predicted logits for this sample
                 predicted_logits_chunk = decoded_logits[kd_idx, :, :]  # (k, vocab_size)
 
                 # Build prompt from previous context
-                # Use the input chunk as context
                 context_chunk = chunks[kd_idx, 0, :].cpu()
                 prompt_text = tokenizer.decode(context_chunk, skip_special_tokens=True)
 
                 try:
-                    # Get teacher distribution
+                    # Get teacher distribution (teacher generates with its own tokenizer)
                     teacher_output = kd_client.get_teacher_distribution(
                         prompt=prompt_text,
                         max_tokens=k,
@@ -222,48 +221,62 @@ def train_epoch(
                         top_logprobs=20,
                     )
 
-                    # Align teacher tokens with student vocabulary and compute KL
-                    if len(teacher_output.normalized_probs) > 0:
+                    # NEW APPROACH: Teacher returns tokens in ITS tokenization
+                    # We need to compute KL in the teacher's token space, not student's
+                    if len(teacher_output.tokens) > 0 and len(teacher_output.normalized_probs) > 0:
                         position_kls = []
 
-                        for pos in range(min(k, len(teacher_output.normalized_probs))):
-                            teacher_probs_dict = teacher_output.normalized_probs[pos]
+                        # For each position in teacher's output
+                        for pos in range(min(k, len(teacher_output.tokens))):
+                            if pos >= len(teacher_output.normalized_probs):
+                                break
 
+                            teacher_probs_dict = teacher_output.normalized_probs[pos]
                             if not teacher_probs_dict:
                                 continue
 
-                            # Create teacher distribution tensor (sparse)
-                            teacher_dist = torch.zeros(predicted_logits_chunk.shape[1], device=device)
+                            # Teacher token at this position (ground truth from teacher)
+                            teacher_token_str = teacher_output.tokens[pos]
 
-                            for token_str, prob in teacher_probs_dict.items():
-                                # Encode teacher token to get ID
-                                token_ids = tokenizer.encode(token_str, add_special_tokens=False)
-                                if len(token_ids) > 0:
-                                    token_id = token_ids[0]
-                                    if token_id < teacher_dist.shape[0]:
-                                        teacher_dist[token_id] = prob
+                            # Convert teacher token string to ID (using TEACHER tokenizer)
+                            # Since tokenizer now uses teacher's tokenizer, this should work
+                            teacher_token_ids = tokenizer.encode(teacher_token_str, add_special_tokens=False)
+                            if len(teacher_token_ids) == 0:
+                                continue
+                            teacher_token_id = teacher_token_ids[0]
 
-                            # Normalize teacher distribution (sparse top-k)
+                            # Get student's probability for this specific teacher token
+                            # predicted_logits_chunk[pos] is student's distribution over vocab
+                            student_probs = F.softmax(predicted_logits_chunk[pos, :], dim=-1)
+
+                            if teacher_token_id >= student_probs.shape[0]:
+                                continue  # Token ID out of range
+
+                            student_prob_for_teacher_token = student_probs[teacher_token_id]
+
+                            # Build teacher distribution as sparse tensor
+                            teacher_dist = torch.zeros(student_probs.shape[0], device=device)
+                            for tok_str, prob in teacher_probs_dict.items():
+                                tok_ids = tokenizer.encode(tok_str, add_special_tokens=False)
+                                if len(tok_ids) > 0:
+                                    tok_id = tok_ids[0]
+                                    if tok_id < teacher_dist.shape[0]:
+                                        teacher_dist[tok_id] = prob
+
+                            # Normalize teacher distribution
                             teacher_dist_sum = teacher_dist.sum()
                             if teacher_dist_sum > 0:
                                 teacher_dist = teacher_dist / teacher_dist_sum
-                            else:
-                                continue
 
-                            # Student distribution for this position
-                            student_logits = predicted_logits_chunk[pos, :]
-                            student_log_probs = F.log_softmax(student_logits, dim=-1)
-
-                            # KL divergence: sum(teacher * log(teacher / student))
-                            # = sum(teacher * (log(teacher) - log(student)))
-                            # For numerical stability with sparse teacher:
-                            teacher_nonzero = teacher_dist > 0
-                            if teacher_nonzero.any():
-                                kl_pos = (
-                                    teacher_dist[teacher_nonzero] *
-                                    (torch.log(teacher_dist[teacher_nonzero]) - student_log_probs[teacher_nonzero])
-                                ).sum()
-                                position_kls.append(kl_pos)
+                                # KL divergence: sum(teacher * log(teacher / student))
+                                student_log_probs = F.log_softmax(predicted_logits_chunk[pos, :], dim=-1)
+                                teacher_nonzero = teacher_dist > 0
+                                if teacher_nonzero.any():
+                                    kl_pos = (
+                                        teacher_dist[teacher_nonzero] *
+                                        (torch.log(teacher_dist[teacher_nonzero]) - student_log_probs[teacher_nonzero])
+                                    ).sum()
+                                    position_kls.append(kl_pos)
 
                         # Average KL over positions in this chunk
                         if position_kls:
