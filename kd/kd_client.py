@@ -89,10 +89,20 @@ class KDClient:
         self.executor = ThreadPoolExecutor(max_workers=4)  # For async I/O
         self.prefetch_enabled = True
 
+        # Adaptive load handling
+        self.max_concurrent_requests = 8  # Semaphore limit
+        self.request_semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        self.adaptive_top_logprobs = 20  # Start with 20
+        self.min_top_logprobs = 10  # Minimum when rate limited
+        self.max_top_logprobs = 20  # Maximum
+        self.rate_limit_count = 0
+        self.successful_window_count = 0
+        self.windows_before_restore = 10  # Restore to 20 after N successful windows
+
         if self.enable_cache:
             self._init_cache_db()
 
-        print(f"✅ KD client initialized with async prefetch support")
+        print(f"✅ KD client initialized with async prefetch and adaptive load handling")
 
     def _init_cache_db(self):
         """Initialize SQLite cache database."""
@@ -206,27 +216,53 @@ class KDClient:
         except Exception as e:
             print(f"Cache write error: {e}")
 
+    def _handle_rate_limit(self):
+        """Handle rate limiting by reducing top_logprobs."""
+        self.rate_limit_count += 1
+        if self.adaptive_top_logprobs > self.min_top_logprobs:
+            self.adaptive_top_logprobs = self.min_top_logprobs
+            print(f"⚠️  Rate limited! Reducing top_logprobs to {self.adaptive_top_logprobs}")
+        self.successful_window_count = 0  # Reset success counter
+
+    def _handle_success(self):
+        """Handle successful request, possibly restoring top_logprobs."""
+        self.successful_window_count += 1
+        if self.successful_window_count >= self.windows_before_restore:
+            if self.adaptive_top_logprobs < self.max_top_logprobs:
+                self.adaptive_top_logprobs = self.max_top_logprobs
+                print(f"✅ Restored top_logprobs to {self.adaptive_top_logprobs} after {self.windows_before_restore} successful requests")
+            self.successful_window_count = 0
+
+    def _is_rate_limit_error(self, error: Exception) -> bool:
+        """Check if error is a rate limit error (429)."""
+        error_str = str(error).lower()
+        return "429" in error_str or "rate limit" in error_str or "too many requests" in error_str
+
     def get_logprobs(
         self,
         messages: List[Dict[str, str]],
         max_tokens: int = 128,
-        top_logprobs: int = 20,
+        top_logprobs: Optional[int] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
     ) -> TeacherOutput:
         """
-        Get logprobs from teacher (with caching).
+        Get logprobs from teacher (with caching and adaptive load handling).
 
         Args:
             messages: Message list
             max_tokens: Max tokens to generate
-            top_logprobs: Top logprobs per position
+            top_logprobs: Top logprobs per position (None = use adaptive)
             temperature: Sampling temperature
             top_p: Nucleus sampling
 
         Returns:
             TeacherOutput with sparse distributions
         """
+        # Use adaptive top_logprobs if not specified
+        if top_logprobs is None:
+            top_logprobs = self.adaptive_top_logprobs
+
         # Check cache
         cache_key = self._get_cache_key(
             messages=messages,
@@ -238,6 +274,7 @@ class KDClient:
 
         cached = self._get_from_cache(cache_key)
         if cached is not None:
+            self._handle_success()  # Successful (from cache)
             return cached
 
         # Call backend
@@ -253,9 +290,14 @@ class KDClient:
             # Save to cache
             self._save_to_cache(cache_key, output)
 
+            self._handle_success()  # Successful
             return output
 
         except Exception as e:
+            # Check if rate limit error
+            if self._is_rate_limit_error(e):
+                self._handle_rate_limit()
+
             # If API fails, try to return cached version if available
             print(f"⚠️  Backend request failed: {e}")
             print(f"   Falling back to cache if available...")
@@ -264,6 +306,7 @@ class KDClient:
             cached = self._get_from_cache(cache_key)
             if cached is not None:
                 print(f"   ✅ Using cached response")
+                self.trained_from_cache += 1
                 return cached
             else:
                 print(f"   ❌ No cached response available")
@@ -448,12 +491,12 @@ class KDClient:
         """Clear the prefetch queue."""
         self.prefetch_queue.clear()
 
-    def get_cache_stats(self) -> Dict[str, int]:
+    def get_cache_stats(self) -> Dict:
         """
-        Get cache statistics.
+        Get cache and load statistics.
 
         Returns:
-            Dict with hits, misses, and hit rate
+            Dict with hits, misses, hit rate, and adaptive load metrics
         """
         total = self.cache_hits + self.cache_misses
         hit_rate = self.cache_hits / total if total > 0 else 0.0
@@ -464,17 +507,23 @@ class KDClient:
             "total_requests": total,
             "hit_rate": hit_rate,
             "trained_from_cache": self.trained_from_cache,
+            "rate_limit_count": self.rate_limit_count,
+            "current_top_logprobs": self.adaptive_top_logprobs,
+            "successful_window_count": self.successful_window_count,
         }
 
     def print_cache_stats(self):
-        """Print cache statistics."""
+        """Print cache and load statistics."""
         stats = self.get_cache_stats()
-        print(f"\nKD Cache Statistics:")
-        print(f"  Hits: {stats['hits']}")
-        print(f"  Misses: {stats['misses']}")
+        print(f"\nKD Cache & Load Statistics:")
+        print(f"  Cache hits: {stats['hits']}")
+        print(f"  Cache misses: {stats['misses']}")
         print(f"  Total requests: {stats['total_requests']}")
         print(f"  Hit rate: {stats['hit_rate']:.2%}")
-        print(f"  Trained from cache (rate limited): {stats['trained_from_cache']}")
+        print(f"  Trained from cache: {stats['trained_from_cache']}")
+        print(f"  Rate limit events: {stats['rate_limit_count']}")
+        print(f"  Current top_logprobs: {stats['current_top_logprobs']}")
+        print(f"  Successful window: {stats['successful_window_count']}/{self.windows_before_restore}")
 
 
 def test_client():
