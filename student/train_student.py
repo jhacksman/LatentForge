@@ -498,6 +498,17 @@ def main():
         for key, value in train_metrics.items():
             print(f"  {key}: {value:.4f}")
 
+        # GB10 memory tracking
+        if torch.cuda.is_available():
+            peak_allocated = torch.cuda.max_memory_allocated() / 1e9  # GB
+            peak_reserved = torch.cuda.max_memory_reserved() / 1e9  # GB
+            current_allocated = torch.cuda.memory_allocated() / 1e9  # GB
+            print(f"\nGPU Memory (GB10):")
+            print(f"  Peak allocated: {peak_allocated:.2f} GB")
+            print(f"  Peak reserved: {peak_reserved:.2f} GB")
+            print(f"  Current allocated: {current_allocated:.2f} GB")
+            torch.cuda.reset_peak_memory_stats()
+
         # Log to CSV
         csv_writer.writerow({
             "epoch": epoch + 1,
