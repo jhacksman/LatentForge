@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Unified KD client with backend selection and caching.
+Unified KD client with backend selection, caching, and async prefetch.
 """
 import os
 import hashlib
 import json
 import sqlite3
+import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 from kd.kd_backend import TeacherBackend, TeacherOutput
@@ -80,11 +82,17 @@ class KDClient:
         self.cache_db_path = self.cache_dir / "kd_cache.sqlite"
         self.cache_hits = 0
         self.cache_misses = 0
+        self.trained_from_cache = 0  # Counter for steps trained from cache (e.g., when rate limited)
+
+        # Async prefetch support
+        self.prefetch_queue = {}  # Cache key -> Future[TeacherOutput]
+        self.executor = ThreadPoolExecutor(max_workers=4)  # For async I/O
+        self.prefetch_enabled = True
 
         if self.enable_cache:
             self._init_cache_db()
 
-        print(f"✅ KD client initialized")
+        print(f"✅ KD client initialized with async prefetch support")
 
     def _init_cache_db(self):
         """Initialize SQLite cache database."""
@@ -291,6 +299,155 @@ class KDClient:
             top_p=top_p,
         )
 
+    def prefetch_async(
+        self,
+        prompt: str,
+        max_tokens: int = 128,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_logprobs: int = 20,
+    ):
+        """
+        Prefetch a KD distribution asynchronously.
+        Starts fetching in background without blocking.
+
+        Args:
+            prompt: Text prompt
+            max_tokens: Max tokens
+            temperature: Temperature
+            top_p: Top-p
+            top_logprobs: Top logprobs count
+        """
+        if not self.prefetch_enabled:
+            return
+
+        messages = [{"role": "user", "content": prompt}]
+
+        # Generate cache key
+        cache_key = self._get_cache_key(
+            messages=messages,
+            max_tokens=max_tokens,
+            top_logprobs=top_logprobs,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        # Check if already in cache or prefetch queue
+        if cache_key in self.prefetch_queue:
+            return
+
+        cached = self._get_from_cache(cache_key)
+        if cached is not None:
+            # Already cached, store directly
+            self.prefetch_queue[cache_key] = cached
+            return
+
+        # Submit async fetch to executor
+        future = self.executor.submit(
+            self._fetch_with_cache,
+            messages,
+            max_tokens,
+            top_logprobs,
+            temperature,
+            top_p,
+            cache_key,
+        )
+        self.prefetch_queue[cache_key] = future
+
+    def _fetch_with_cache(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        top_logprobs: int,
+        temperature: float,
+        top_p: float,
+        cache_key: str,
+    ) -> Optional[TeacherOutput]:
+        """Internal method to fetch with caching (for executor)."""
+        try:
+            output = self.backend.get_logprobs(
+                messages=messages,
+                max_tokens=max_tokens,
+                top_logprobs=top_logprobs,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            self._save_to_cache(cache_key, output)
+            return output
+        except Exception as e:
+            # If fetch fails, try cache
+            print(f"Prefetch failed: {e}, trying cache...")
+            cached = self._get_from_cache(cache_key)
+            if cached:
+                self.trained_from_cache += 1
+            return cached
+
+    def get_prefetched(
+        self,
+        prompt: str,
+        max_tokens: int = 128,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_logprobs: int = 20,
+        timeout: float = 10.0,
+    ) -> Optional[TeacherOutput]:
+        """
+        Get a prefetched KD distribution.
+        If not yet ready, waits up to timeout seconds.
+        If rate limited or failed, returns cached version if available.
+
+        Args:
+            prompt: Text prompt
+            max_tokens: Max tokens
+            temperature: Temperature
+            top_p: Top-p
+            top_logprobs: Top logprobs count
+            timeout: Max wait time in seconds
+
+        Returns:
+            TeacherOutput or None if not available
+        """
+        messages = [{"role": "user", "content": prompt}]
+
+        cache_key = self._get_cache_key(
+            messages=messages,
+            max_tokens=max_tokens,
+            top_logprobs=top_logprobs,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        # Check prefetch queue
+        if cache_key in self.prefetch_queue:
+            result = self.prefetch_queue[cache_key]
+
+            # If it's already a TeacherOutput (cached), return directly
+            if isinstance(result, TeacherOutput):
+                del self.prefetch_queue[cache_key]
+                return result
+
+            # Otherwise it's a Future, wait for it
+            try:
+                output = result.result(timeout=timeout)
+                del self.prefetch_queue[cache_key]
+                return output
+            except Exception as e:
+                print(f"Failed to get prefetched result: {e}")
+                # Fall through to direct fetch
+
+        # Not prefetched, fetch directly
+        return self.get_teacher_distribution(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_logprobs=top_logprobs,
+        )
+
+    def clear_prefetch_queue(self):
+        """Clear the prefetch queue."""
+        self.prefetch_queue.clear()
+
     def get_cache_stats(self) -> Dict[str, int]:
         """
         Get cache statistics.
@@ -306,6 +463,7 @@ class KDClient:
             "misses": self.cache_misses,
             "total_requests": total,
             "hit_rate": hit_rate,
+            "trained_from_cache": self.trained_from_cache,
         }
 
     def print_cache_stats(self):
@@ -316,6 +474,7 @@ class KDClient:
         print(f"  Misses: {stats['misses']}")
         print(f"  Total requests: {stats['total_requests']}")
         print(f"  Hit rate: {stats['hit_rate']:.2%}")
+        print(f"  Trained from cache (rate limited): {stats['trained_from_cache']}")
 
 
 def test_client():
