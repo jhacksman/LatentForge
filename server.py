@@ -8,8 +8,12 @@ from typing import Optional
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
+import json
+import asyncio
+from typing import AsyncGenerator
 
 from student.sampler import LatentSampler, load_models
 
@@ -159,6 +163,70 @@ async def generate(request: GenerateRequest):
             status_code=500,
             detail=f"Generation failed: {str(e)}",
         )
+
+
+@app.post("/generate_stream")
+async def generate_stream(request: GenerateRequest):
+    """
+    Generate text from prompt with streaming.
+
+    Args:
+        request: Generation request
+
+    Returns:
+        Server-Sent Events stream of generated tokens
+    """
+    if sampler is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Models not loaded. Check server startup logs.",
+        )
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        """Generate SSE events for streaming."""
+        try:
+            # Since our current sampler doesn't support token-by-token streaming,
+            # we'll simulate it by generating chunks at a time
+            # In production, you'd modify LatentSampler to yield tokens
+
+            # Generate full text (in production, modify sampler to stream)
+            generated_text = await asyncio.to_thread(
+                sampler.sample,
+                prompt=request.prompt,
+                max_new_tokens=request.max_new_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                seed=request.seed,
+            )
+
+            # Stream the result in chunks
+            chunk_size = max(1, len(generated_text) // 10)
+            for i in range(0, len(generated_text), chunk_size):
+                chunk = generated_text[i : i + chunk_size]
+                event_data = {
+                    "text": chunk,
+                    "done": i + chunk_size >= len(generated_text),
+                }
+                yield f"data: {json.dumps(event_data)}\n\n"
+                await asyncio.sleep(0.01)  # Small delay for streaming effect
+
+            # Send final done event
+            yield f"data: {json.dumps({'done': True})}\n\n"
+
+        except Exception as e:
+            error_data = {"error": str(e), "done": True}
+            yield f"data: {json.dumps(error_data)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def main():

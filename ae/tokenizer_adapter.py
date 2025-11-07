@@ -1,27 +1,43 @@
 """
 Tokenizer adapter for the autoencoder.
-Reuses the teacher model's tokenizer (Qwen).
+Reuses the teacher model's tokenizer (Qwen3-Next-80B).
+CRITICAL: This tokenizer MUST match the teacher backend exactly for proper KD alignment.
 """
 from typing import List, Union, Optional
+import os
 import torch
 from transformers import AutoTokenizer
 
 
 class TokenizerAdapter:
-    """Adapter for teacher tokenizer."""
+    """Adapter for teacher tokenizer. Always uses the same tokenizer as the teacher."""
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-7B",
+        model_name: Optional[str] = None,
         trust_remote_code: bool = True,
     ):
         """
         Initialize tokenizer adapter.
 
         Args:
-            model_name: HuggingFace model name for tokenizer
+            model_name: HuggingFace model name for tokenizer. If None, infers from TEACHER_BACKEND env.
             trust_remote_code: Whether to trust remote code
         """
+        # If no model_name provided, infer from teacher backend
+        if model_name is None:
+            teacher_backend = os.getenv("TEACHER_BACKEND", "venice")
+            if teacher_backend == "venice":
+                # Venice uses qwen3-next-80b
+                model_name = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+            elif teacher_backend in ["vllm-local", "vllm-remote"]:
+                # vLLM uses the model from env
+                model_name = os.getenv("VLLM_LOCAL_MODEL", "Qwen/Qwen3-Next-80B-A3B-Instruct")
+            else:
+                # Default fallback
+                model_name = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+        self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
             trust_remote_code=trust_remote_code,
@@ -32,6 +48,7 @@ class TokenizerAdapter:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.vocab_size = len(self.tokenizer)
+        print(f"TokenizerAdapter: Using {model_name} tokenizer (vocab_size={self.vocab_size})")
 
     def encode(
         self,

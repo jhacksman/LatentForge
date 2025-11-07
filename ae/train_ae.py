@@ -5,6 +5,7 @@ Train the latent autoencoder.
 import os
 import sys
 import argparse
+import csv
 from pathlib import Path
 import yaml
 import torch
@@ -221,6 +222,19 @@ def main():
     print(f"\nTraining for {args.epochs} epochs...")
     best_exact_match = 0.0
 
+    # CSV logging
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    csv_path = results_dir / "ae_metrics.csv"
+
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.DictWriter(
+        csv_file,
+        fieldnames=["epoch", "loss", "ce_loss", "l2_loss", "token_accuracy", "exact_match"],
+    )
+    csv_writer.writeheader()
+    print(f"Logging metrics to {csv_path}")
+
     for epoch in range(args.epochs):
         print(f"\n=== Epoch {epoch + 1}/{args.epochs} ===")
 
@@ -232,6 +246,13 @@ def main():
         print(f"\nTrain metrics:")
         for key, value in train_metrics.items():
             print(f"  {key}: {value:.4f}")
+
+        # Log to CSV
+        csv_writer.writerow({
+            "epoch": epoch + 1,
+            **train_metrics,
+        })
+        csv_file.flush()
 
         # Save checkpoint
         os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -258,8 +279,10 @@ def main():
             )
             print(f"✅ Saved checkpoint: {checkpoint_path} (exact_match: {best_exact_match:.4f})")
 
+    csv_file.close()
     print(f"\n🎉 Training complete!")
     print(f"Best exact match: {best_exact_match:.4f}")
+    print(f"Metrics saved to {csv_path}")
 
     if best_exact_match >= 0.995:
         print("✅ Target ≥99.5% exact reconstruction achieved!")

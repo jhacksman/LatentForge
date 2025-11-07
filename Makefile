@@ -1,28 +1,44 @@
-.PHONY: help setup check-api toy train-ae train-student infer serve bench test test-fast test-e2e clean
+.PHONY: help setup check-api toy train-ae train-student train-student-venice train-student-vllm-local train-student-vllm-remote train-student-deepspeed train-student-deepspeed-zero3 serve-vllm-local infer serve bench test test-fast test-e2e clean
 
 # Default target
 help:
 	@echo "LatentForge - Makefile targets:"
 	@echo ""
-	@echo "  setup           - Create venv and install dependencies"
-	@echo "  check-api       - Verify Venice API connection"
-	@echo "  toy             - Create toy dataset and pack it"
-	@echo "  train-ae        - Train autoencoder"
-	@echo "  train-student   - Train student with KD"
-	@echo "  infer           - Run inference"
-	@echo "  serve           - Start FastAPI server"
-	@echo "  bench           - Run benchmark"
-	@echo "  test            - Run all tests"
-	@echo "  test-fast       - Run fast unit tests only"
-	@echo "  test-e2e        - Run end-to-end tests"
-	@echo "  clean           - Clean generated files"
+	@echo "Setup & Data:"
+	@echo "  setup                      - Create venv and install dependencies"
+	@echo "  check-api                  - Verify Venice API connection"
+	@echo "  toy                        - Create toy dataset and pack it"
+	@echo ""
+	@echo "Training:"
+	@echo "  train-ae                   - Train autoencoder"
+	@echo "  train-student              - Train student with KD (uses TEACHER_BACKEND env)"
+	@echo "  train-student-venice       - Train with Venice API teacher"
+	@echo "  train-student-vllm-local   - Train with local vLLM teacher"
+	@echo "  train-student-vllm-remote  - Train with remote vLLM teacher"
+	@echo "  train-student-deepspeed    - Train with DeepSpeed ZeRO-2"
+	@echo "  train-student-deepspeed-zero3 - Train with DeepSpeed ZeRO-3"
+	@echo ""
+	@echo "vLLM Teacher:"
+	@echo "  serve-vllm-local           - Start local vLLM teacher server"
+	@echo ""
+	@echo "Inference & Serving:"
+	@echo "  infer                      - Run inference"
+	@echo "  serve                      - Start FastAPI server"
+	@echo "  bench                      - Run benchmark"
+	@echo ""
+	@echo "Testing:"
+	@echo "  test                       - Run all tests"
+	@echo "  test-fast                  - Run fast unit tests only"
+	@echo "  test-e2e                   - Run end-to-end tests"
+	@echo ""
+	@echo "  clean                      - Clean generated files"
 	@echo ""
 	@echo "Example usage:"
 	@echo "  make setup"
 	@echo "  make check-api"
 	@echo "  make toy"
 	@echo "  make train-ae"
-	@echo "  make train-student"
+	@echo "  TEACHER_BACKEND=venice make train-student"
 	@echo "  make infer"
 	@echo ""
 
@@ -35,7 +51,7 @@ setup:
 	@echo ""
 	@echo "Activating and installing dependencies..."
 	.venv/bin/pip install --upgrade pip
-	.venv/bin/pip install torch transformers==4.43.0 accelerate fastapi uvicorn pydantic requests python-dotenv pytest pytest-timeout httpx tabulate rich
+	.venv/bin/pip install torch transformers==4.43.0 accelerate fastapi uvicorn pydantic requests python-dotenv pytest pytest-timeout httpx tabulate rich vllm openai
 	@echo ""
 	@echo "✅ Dependencies installed"
 	@echo ""
@@ -109,6 +125,59 @@ train-student:
 		--ce_w $(CE_W) \
 		--epochs 1 \
 		--bf16
+
+# Backend-specific training targets
+train-student-venice:
+	@echo "Training student with Venice API teacher..."
+	TEACHER_BACKEND=venice $(MAKE) train-student
+
+train-student-vllm-local:
+	@echo "Training student with local vLLM teacher..."
+	TEACHER_BACKEND=vllm-local $(MAKE) train-student
+
+train-student-vllm-remote:
+	@echo "Training student with remote vLLM teacher..."
+	TEACHER_BACKEND=vllm-remote $(MAKE) train-student
+
+# DeepSpeed training targets
+DEEPSPEED_CONFIG ?= configs/deepspeed_gb10.json
+
+train-student-deepspeed:
+	@echo "Training student with DeepSpeed ZeRO-2..."
+	python student/train_student.py \
+		--data $(DATA) \
+		--ae_ckpt $(AE_CKPT) \
+		--k $(K) \
+		--latent_dim $(D) \
+		--kd_w $(KD_W) \
+		--mse_w $(MSE_W) \
+		--ce_w $(CE_W) \
+		--epochs 1 \
+		--bf16 \
+		--deepspeed \
+		--deepspeed_config configs/deepspeed_gb10.json \
+		--use_kd
+
+train-student-deepspeed-zero3:
+	@echo "Training student with DeepSpeed ZeRO-3..."
+	python student/train_student.py \
+		--data $(DATA) \
+		--ae_ckpt $(AE_CKPT) \
+		--k $(K) \
+		--latent_dim $(D) \
+		--kd_w $(KD_W) \
+		--mse_w $(MSE_W) \
+		--ce_w $(CE_W) \
+		--epochs 1 \
+		--bf16 \
+		--deepspeed \
+		--deepspeed_config configs/deepspeed_gb10_zero3.json \
+		--use_kd
+
+# vLLM teacher server
+serve-vllm-local:
+	@echo "Starting local vLLM teacher server..."
+	bash tools/serve_teacher_vllm.sh
 
 # Inference
 PROMPT ?= "Smoke test"

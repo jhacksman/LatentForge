@@ -10,7 +10,7 @@ This implementation achieves ~K× speedup (K=8 by default) by operating in compr
 
 - **Autoencoder (AE)**: Compresses K tokens → 1 latent vector (default K=8)
 - **Student Transformer**: Predicts next latent autoregressively
-- **Knowledge Distillation**: From Qwen 3 Next 80B via Venice API logprobs
+- **Knowledge Distillation**: From Qwen 3 Next 80B via Venice API with sparse top_logprobs (top-20 tokens per position)
 - **Full Stack**: CLI, REST API, benchmarking, and comprehensive tests
 
 ### Key Features
@@ -19,6 +19,114 @@ This implementation achieves ~K× speedup (K=8 by default) by operating in compr
 - **Teacher distillation**: KL divergence loss from Qwen 3 Next 80B logprobs
 - **Production-ready**: FastAPI server with CORS, pytest test suite
 - **Flexible losses**: Configurable CE, MSE, and KD weights
+- **GB10 Optimized**: Single-node deployment on NVIDIA GB10 Grace-Blackwell superchip
+
+## GB10 Single-Node Teacher Options
+
+LatentForge supports three teacher deployment scenarios optimized for **single GB10** (NVIDIA Grace-Blackwell superchip with 128GB unified memory):
+
+### Scenario A: Venice API (Remote Teacher)
+
+Use Venice.ai's hosted Qwen3-Next-80B via API. No local GPU resources required for teacher.
+
+```bash
+# .env configuration
+TEACHER_BACKEND=venice
+VENICE_BASE_URL=https://api.venice.ai/api/v1
+VENICE_API_KEY=your_key_here
+VENICE_MODEL=qwen3-next-80b
+
+# Train student
+make train-student-venice
+```
+
+**Pros**: No local teacher compute, always available, easy setup
+**Cons**: API rate limits, network latency, costs per token
+
+### Scenario B: Local vLLM Teacher (Same GB10)
+
+Run Qwen3-Next-80B INT4 quantized **on the same GB10** using vLLM. Recommended configuration:
+
+```bash
+# .env configuration
+TEACHER_BACKEND=vllm-local
+VLLM_LOCAL_MODEL=Qwen/Qwen3-Next-80B-A3B-Instruct
+VLLM_QUANTIZATION=gptq           # or awq
+VLLM_MAX_MODEL_LEN=32768
+VLLM_GPU_MEMORY_UTIL=0.85        # Leave room for student
+
+# Option 1: In-process (loads model directly in training)
+make train-student-vllm-local
+
+# Option 2: Separate server process (recommended)
+make serve-vllm-local &          # Start teacher server
+make train-student-vllm-local    # Train student
+```
+
+**Memory Breakdown on GB10 (128GB unified)**:
+- Qwen3-Next-80B INT4 (GPTQ): ~40GB
+- Student + gradients + activations: ~30GB
+- KV cache + vLLM overhead: ~20GB
+- System + buffers: ~38GB
+
+**Pros**: No API costs, low latency, full control
+**Cons**: Requires downloading 80B model (~40GB), shares GPU with student
+
+### Scenario C: Remote vLLM Teacher (Another GB10)
+
+Run Qwen3-Next-80B on a **separate GB10** and connect via OpenAI-compatible API:
+
+```bash
+# On teacher GB10:
+cd LatentForge
+make serve-vllm-local           # Serves on port 8000
+
+# On student GB10 - .env configuration:
+TEACHER_BACKEND=vllm-remote
+VLLM_REMOTE_URL=http://10.0.0.5:8000/v1
+VLLM_REMOTE_API_KEY=              # Optional
+
+# Train student
+make train-student-vllm-remote
+```
+
+**Pros**: Full 128GB available for each model, no resource contention, fastest inference
+**Cons**: Requires two GB10 systems, network setup
+
+### GB10 Optimization Notes
+
+1. **INT4 Quantization Recommended**:
+   - GPTQ or AWQ reduces 80B model from ~160GB (FP16) to ~40GB
+   - Minimal quality loss for KD purposes
+   - Fits comfortably on single GB10
+
+2. **Bandwidth Constraints**:
+   - GB10 has 301 GB/s memory bandwidth (vs 3350 GB/s on H100)
+   - Use gradient accumulation: `--gradient_accumulation_steps 4`
+   - Use activation checkpointing: `--use_activation_checkpointing`
+   - Smaller batch sizes: 8-16 instead of 32+
+
+3. **KD Caching**:
+   - All backends cache distributions in `./cache/kd_cache.sqlite`
+   - Reduces API calls and network traffic
+   - View stats: automatically printed after training
+
+4. **Recommended Settings for GB10**:
+   ```bash
+   # AE training
+   make train-ae K=8 D=1024 EPOCHS=10 BATCH_SIZE=16
+
+   # Student training (any backend)
+   python student/train_student.py \
+     --data ./data/packed_toy \
+     --ae_ckpt checkpoints/ae.pt \
+     --k 8 \
+     --latent_dim 1024 \
+     --batch_size 8 \
+     --gradient_accumulation_steps 4 \
+     --use_activation_checkpointing \
+     --bf16
+   ```
 
 ## Setup
 
@@ -139,9 +247,11 @@ make train-student
 This trains the student to predict next latents with:
 - **CE loss**: Cross-entropy on decoded tokens
 - **MSE loss**: Mean squared error in latent space
-- **KD loss**: KL divergence to teacher distributions
+- **KD loss**: KL divergence to teacher distributions from sparse top_logprobs (top-20 tokens per position)
 
 Default weights: `KD_W=1.0`, `MSE_W=1.0`, `CE_W=1.0`
+
+**Note**: The KD loss uses Venice API's `top_logprobs=20` parameter to get sparse teacher distributions, providing efficient knowledge transfer without requiring full vocabulary distributions.
 
 Checkpoint saved to: `checkpoints/student.pt`
 

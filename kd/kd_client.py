@@ -1,201 +1,316 @@
+#!/usr/bin/env python3
 """
-Knowledge distillation client for Venice API chat completions.
+Unified KD client with backend selection, caching, and async prefetch.
 """
 import os
-import math
-import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-import requests
+import hashlib
+import json
+import sqlite3
+import asyncio
+from pathlib import Path
+from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
-
-@dataclass
-class TeacherOutput:
-    """Teacher model output with token distributions."""
-    tokens: List[str]  # Generated tokens
-    token_ids: List[int]  # Token IDs (if available)
-    logprobs: List[Dict[str, float]]  # Per-position logprobs {token: logprob}
-    normalized_probs: List[Dict[str, float]]  # Normalized probabilities {token: prob}
-    full_text: str  # Complete generated text
+from kd.kd_backend import TeacherBackend, TeacherOutput
+from kd.venice_backend import VeniceBackend
+from kd.vllm_backend import VLLMBackend
 
 
-class VeniceKDClient:
-    """Client for knowledge distillation from Venice API."""
+class KDClient:
+    """
+    Unified knowledge distillation client.
+
+    Selects backend based on TEACHER_BACKEND environment variable:
+    - venice: Venice API (remote)
+    - vllm-local: Local vLLM in-process
+    - vllm-remote: Remote vLLM API
+
+    Includes on-disk caching for KD distributions.
+    """
 
     def __init__(
         self,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        timeout: int = 60,
-        max_retries: int = 3,
-        max_backoff: float = 32.0,
+        backend_type: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        enable_cache: bool = True,
+        **backend_kwargs,
     ):
         """
-        Initialize Venice KD client.
+        Initialize KD client.
 
         Args:
-            base_url: Venice API base URL (default from env)
-            api_key: API key (default from env)
-            model: Model name (default from env)
-            timeout: Request timeout in seconds
-            max_retries: Maximum retry attempts
-            max_backoff: Maximum backoff time in seconds
+            backend_type: Backend type (venice, vllm-local, vllm-remote)
+                         Defaults to TEACHER_BACKEND env var
+            cache_dir: Directory for KD cache (default: ./cache)
+            enable_cache: Enable KD caching
+            **backend_kwargs: Additional arguments for backend initialization
         """
         load_dotenv()
 
-        self.base_url = base_url or os.getenv("VENICE_BASE_URL")
-        self.api_key = api_key or os.getenv("VENICE_API_KEY")
-        self.model = model or os.getenv("VENICE_MODEL")
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.max_backoff = max_backoff
+        # Determine backend type
+        self.backend_type = backend_type or os.getenv("TEACHER_BACKEND", "venice")
 
-        if not all([self.base_url, self.api_key, self.model]):
-            raise ValueError("Missing Venice API credentials. Check .env file.")
+        # Initialize backend
+        print(f"Initializing KD client with backend: {self.backend_type}")
 
-        self.completions_endpoint = f"{self.base_url}/chat/completions"
-        self.models_endpoint = f"{self.base_url}/models"
+        if self.backend_type == "venice":
+            self.backend = VeniceBackend(**backend_kwargs)
+        elif self.backend_type == "vllm-local":
+            # Local vLLM
+            model_path = backend_kwargs.get("model_path") or os.getenv("VLLM_LOCAL_MODEL")
+            if not model_path:
+                raise ValueError("VLLM_LOCAL_MODEL not set for vllm-local backend")
+            self.backend = VLLMBackend(model_path=model_path, **backend_kwargs)
+        elif self.backend_type == "vllm-remote":
+            # Remote vLLM
+            base_url = backend_kwargs.get("base_url") or os.getenv("VLLM_REMOTE_URL")
+            if not base_url:
+                raise ValueError("VLLM_REMOTE_URL not set for vllm-remote backend")
+            self.backend = VLLMBackend(base_url=base_url, **backend_kwargs)
+        else:
+            raise ValueError(
+                f"Unknown backend type: {self.backend_type}. "
+                f"Valid options: venice, vllm-local, vllm-remote"
+            )
 
-    def _get_headers(self) -> Dict[str, str]:
-        """Get request headers with authorization."""
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        # Initialize cache
+        self.enable_cache = enable_cache
+        self.cache_dir = Path(cache_dir or "./cache")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _handle_request_with_backoff(
+        self.cache_db_path = self.cache_dir / "kd_cache.sqlite"
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.trained_from_cache = 0  # Counter for steps trained from cache (e.g., when rate limited)
+
+        # Async prefetch support
+        self.prefetch_queue = {}  # Cache key -> Future[TeacherOutput]
+        self.executor = ThreadPoolExecutor(max_workers=4)  # For async I/O
+        self.prefetch_enabled = True
+
+        # Adaptive load handling
+        self.max_concurrent_requests = 8  # Semaphore limit
+        self.request_semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        self.adaptive_top_logprobs = 20  # Start with 20
+        self.min_top_logprobs = 10  # Minimum when rate limited
+        self.max_top_logprobs = 20  # Maximum
+        self.rate_limit_count = 0
+        self.successful_window_count = 0
+        self.windows_before_restore = 10  # Restore to 20 after N successful windows
+
+        if self.enable_cache:
+            self._init_cache_db()
+
+        print(f"✅ KD client initialized with async prefetch and adaptive load handling")
+
+    def _init_cache_db(self):
+        """Initialize SQLite cache database."""
+        conn = sqlite3.connect(self.cache_db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS kd_cache (
+                cache_key TEXT PRIMARY KEY,
+                teacher_output TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+
+    def _get_cache_key(
         self,
-        method: str,
-        url: str,
-        **kwargs,
-    ) -> requests.Response:
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        top_logprobs: int,
+        temperature: float,
+        top_p: float,
+    ) -> str:
         """
-        Make HTTP request with exponential backoff for retryable errors.
+        Generate cache key for request.
 
         Args:
-            method: HTTP method (GET, POST)
-            url: Request URL
-            **kwargs: Additional request arguments
+            messages: Message list
+            max_tokens: Max tokens
+            top_logprobs: Top logprobs count
+            temperature: Temperature
+            top_p: Top-p value
 
         Returns:
-            Response object
-
-        Raises:
-            RuntimeError: On auth errors or max retries exceeded
+            Cache key (SHA256 hash)
         """
-        for attempt in range(self.max_retries):
-            try:
-                response = requests.request(method, url, **kwargs)
+        # Include backend type and all params in key
+        key_data = {
+            "backend": self.backend_type,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "top_logprobs": top_logprobs,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
 
-                # Check for auth errors (don't retry)
-                if response.status_code == 401:
-                    raise RuntimeError(
-                        "Authentication failed. Check your VENICE_API_KEY in .env file."
-                    )
+        key_str = json.dumps(key_data, sort_keys=True)
+        return hashlib.sha256(key_str.encode()).hexdigest()
 
-                # Check for rate limiting or server errors (retry with backoff)
-                if response.status_code == 429 or response.status_code >= 500:
-                    if attempt < self.max_retries - 1:
-                        # Capped exponential backoff
-                        backoff = min(2 ** attempt, self.max_backoff)
-                        time.sleep(backoff)
-                        continue
-                    else:
-                        raise RuntimeError(
-                            f"API request failed after {self.max_retries} retries. "
-                            f"Status: {response.status_code}, Response: {response.text}"
-                        )
+    def _get_from_cache(self, cache_key: str) -> Optional[TeacherOutput]:
+        """Get cached output."""
+        if not self.enable_cache:
+            return None
 
-                # Raise for other HTTP errors
-                response.raise_for_status()
-                return response
+        try:
+            conn = sqlite3.connect(self.cache_db_path)
+            cursor = conn.cursor()
 
-            except requests.exceptions.Timeout as e:
-                if attempt < self.max_retries - 1:
-                    backoff = min(2 ** attempt, self.max_backoff)
-                    time.sleep(backoff)
-                    continue
-                raise RuntimeError(f"Request timed out after {self.max_retries} attempts: {e}")
+            cursor.execute(
+                "SELECT teacher_output FROM kd_cache WHERE cache_key = ?",
+                (cache_key,)
+            )
 
-            except requests.exceptions.ConnectionError as e:
-                if attempt < self.max_retries - 1:
-                    backoff = min(2 ** attempt, self.max_backoff)
-                    time.sleep(backoff)
-                    continue
-                raise RuntimeError(f"Connection error after {self.max_retries} attempts: {e}")
+            row = cursor.fetchone()
+            conn.close()
 
-            except requests.exceptions.RequestException as e:
-                # Don't retry for other request exceptions
-                raise RuntimeError(f"Request failed: {e}")
+            if row:
+                self.cache_hits += 1
+                # Deserialize
+                data = json.loads(row[0])
+                return TeacherOutput(
+                    tokens=data["tokens"],
+                    logprobs=data["logprobs"],
+                    normalized_probs=data["normalized_probs"],
+                )
+            else:
+                self.cache_misses += 1
+                return None
 
-        raise RuntimeError(f"Request failed after {self.max_retries} attempts")
+        except Exception as e:
+            print(f"Cache read error: {e}")
+            self.cache_misses += 1
+            return None
 
-    def list_models(self) -> List[Dict]:
-        """
-        List available models from Venice API.
+    def _save_to_cache(self, cache_key: str, output: TeacherOutput):
+        """Save output to cache."""
+        if not self.enable_cache:
+            return
 
-        Returns:
-            List of model dictionaries with id, name, etc.
+        try:
+            # Serialize
+            data = {
+                "tokens": output.tokens,
+                "logprobs": output.logprobs,
+                "normalized_probs": output.normalized_probs,
+            }
 
-        Raises:
-            RuntimeError: On API errors
-        """
-        response = self._handle_request_with_backoff(
-            "GET",
-            self.models_endpoint,
-            headers=self._get_headers(),
-            timeout=self.timeout,
-        )
+            conn = sqlite3.connect(self.cache_db_path)
+            cursor = conn.cursor()
 
-        data = response.json()
-        return data.get("data", [])
+            cursor.execute(
+                "INSERT OR REPLACE INTO kd_cache (cache_key, teacher_output) VALUES (?, ?)",
+                (cache_key, json.dumps(data))
+            )
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            print(f"Cache write error: {e}")
+
+    def _handle_rate_limit(self):
+        """Handle rate limiting by reducing top_logprobs."""
+        self.rate_limit_count += 1
+        if self.adaptive_top_logprobs > self.min_top_logprobs:
+            self.adaptive_top_logprobs = self.min_top_logprobs
+            print(f"⚠️  Rate limited! Reducing top_logprobs to {self.adaptive_top_logprobs}")
+        self.successful_window_count = 0  # Reset success counter
+
+    def _handle_success(self):
+        """Handle successful request, possibly restoring top_logprobs."""
+        self.successful_window_count += 1
+        if self.successful_window_count >= self.windows_before_restore:
+            if self.adaptive_top_logprobs < self.max_top_logprobs:
+                self.adaptive_top_logprobs = self.max_top_logprobs
+                print(f"✅ Restored top_logprobs to {self.adaptive_top_logprobs} after {self.windows_before_restore} successful requests")
+            self.successful_window_count = 0
+
+    def _is_rate_limit_error(self, error: Exception) -> bool:
+        """Check if error is a rate limit error (429)."""
+        error_str = str(error).lower()
+        return "429" in error_str or "rate limit" in error_str or "too many requests" in error_str
 
     def get_logprobs(
         self,
         messages: List[Dict[str, str]],
         max_tokens: int = 128,
-        top_logprobs: int = 20,
+        top_logprobs: Optional[int] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
     ) -> TeacherOutput:
         """
-        Get logprobs from chat completion.
+        Get logprobs from teacher (with caching and adaptive load handling).
 
         Args:
-            messages: List of message dicts with role and content
-            max_tokens: Maximum tokens to generate
-            top_logprobs: Number of top logprobs to return (1-20)
+            messages: Message list
+            max_tokens: Max tokens to generate
+            top_logprobs: Top logprobs per position (None = use adaptive)
             temperature: Sampling temperature
-            top_p: Nucleus sampling parameter
+            top_p: Nucleus sampling
 
         Returns:
-            TeacherOutput with sparse per-position distributions
-
-        Raises:
-            RuntimeError: On API errors
+            TeacherOutput with sparse distributions
         """
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "logprobs": True,
-            "top_logprobs": top_logprobs,
-        }
+        # Use adaptive top_logprobs if not specified
+        if top_logprobs is None:
+            top_logprobs = self.adaptive_top_logprobs
 
-        response = self._handle_request_with_backoff(
-            "POST",
-            self.completions_endpoint,
-            headers=self._get_headers(),
-            json=payload,
-            timeout=self.timeout,
+        # Check cache
+        cache_key = self._get_cache_key(
+            messages=messages,
+            max_tokens=max_tokens,
+            top_logprobs=top_logprobs,
+            temperature=temperature,
+            top_p=top_p,
         )
 
-        data = response.json()
-        return self._parse_response(data)
+        cached = self._get_from_cache(cache_key)
+        if cached is not None:
+            self._handle_success()  # Successful (from cache)
+            return cached
+
+        # Call backend
+        try:
+            output = self.backend.get_logprobs(
+                messages=messages,
+                max_tokens=max_tokens,
+                top_logprobs=top_logprobs,
+                temperature=temperature,
+                top_p=top_p,
+            )
+
+            # Save to cache
+            self._save_to_cache(cache_key, output)
+
+            self._handle_success()  # Successful
+            return output
+
+        except Exception as e:
+            # Check if rate limit error
+            if self._is_rate_limit_error(e):
+                self._handle_rate_limit()
+
+            # If API fails, try to return cached version if available
+            print(f"⚠️  Backend request failed: {e}")
+            print(f"   Falling back to cache if available...")
+
+            # Force cache lookup even if we already tried
+            cached = self._get_from_cache(cache_key)
+            if cached is not None:
+                print(f"   ✅ Using cached response")
+                self.trained_from_cache += 1
+                return cached
+            else:
+                print(f"   ❌ No cached response available")
+                raise
 
     def get_teacher_distribution(
         self,
@@ -206,17 +321,17 @@ class VeniceKDClient:
         top_logprobs: int = 20,
     ) -> TeacherOutput:
         """
-        Get teacher model output with token distributions.
+        Convenience method for single prompt.
 
         Args:
-            prompt: Input prompt
-            max_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            top_p: Nucleus sampling parameter
-            top_logprobs: Number of top logprobs to return
+            prompt: Text prompt
+            max_tokens: Max tokens
+            temperature: Temperature
+            top_p: Top-p
+            top_logprobs: Top logprobs count
 
         Returns:
-            TeacherOutput with tokens and distributions
+            TeacherOutput
         """
         messages = [{"role": "user", "content": prompt}]
         return self.get_logprobs(
@@ -227,108 +342,197 @@ class VeniceKDClient:
             top_p=top_p,
         )
 
-    def _parse_response(self, data: Dict) -> TeacherOutput:
-        """
-        Parse Venice API response into TeacherOutput.
-
-        Args:
-            data: API response JSON
-
-        Returns:
-            TeacherOutput with parsed distributions
-        """
-        choice = data["choices"][0]
-        full_text = choice["message"]["content"]
-
-        # Extract logprobs from response
-        logprobs_data = choice.get("logprobs", {})
-        content_logprobs = logprobs_data.get("content", [])
-
-        tokens = []
-        token_ids = []
-        logprobs = []
-        normalized_probs = []
-
-        for item in content_logprobs:
-            # Current token
-            token = item.get("token", "")
-            token_id = item.get("token_id", -1)
-            tokens.append(token)
-            token_ids.append(token_id)
-
-            # Top logprobs for this position
-            top_logprobs = item.get("top_logprobs", [])
-
-            # Build logprob dict
-            logprob_dict = {}
-            for entry in top_logprobs:
-                tok = entry.get("token", "")
-                logp = entry.get("logprob", -float("inf"))
-                logprob_dict[tok] = logp
-
-            logprobs.append(logprob_dict)
-
-            # Normalize to probabilities
-            # Use log-sum-exp trick for numerical stability
-            if logprob_dict:
-                max_logp = max(logprob_dict.values())
-                log_sum_exp = max_logp + math.log(
-                    sum(math.exp(lp - max_logp) for lp in logprob_dict.values())
-                )
-
-                prob_dict = {}
-                for tok, logp in logprob_dict.items():
-                    prob = math.exp(logp - log_sum_exp)
-                    prob_dict[tok] = prob
-
-                normalized_probs.append(prob_dict)
-            else:
-                normalized_probs.append({})
-
-        return TeacherOutput(
-            tokens=tokens,
-            token_ids=token_ids,
-            logprobs=logprobs,
-            normalized_probs=normalized_probs,
-            full_text=full_text,
-        )
-
-    def get_distribution_for_tokens(
+    def prefetch_async(
         self,
         prompt: str,
-        target_tokens: List[str],
-        **kwargs,
-    ) -> List[Dict[str, float]]:
+        max_tokens: int = 128,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_logprobs: int = 20,
+    ):
         """
-        Get teacher distributions for specific target tokens.
+        Prefetch a KD distribution asynchronously.
+        Starts fetching in background without blocking.
 
         Args:
-            prompt: Input prompt
-            target_tokens: Target tokens to get distributions for
-            **kwargs: Additional arguments for get_teacher_distribution
+            prompt: Text prompt
+            max_tokens: Max tokens
+            temperature: Temperature
+            top_p: Top-p
+            top_logprobs: Top logprobs count
+        """
+        if not self.prefetch_enabled:
+            return
+
+        messages = [{"role": "user", "content": prompt}]
+
+        # Generate cache key
+        cache_key = self._get_cache_key(
+            messages=messages,
+            max_tokens=max_tokens,
+            top_logprobs=top_logprobs,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        # Check if already in cache or prefetch queue
+        if cache_key in self.prefetch_queue:
+            return
+
+        cached = self._get_from_cache(cache_key)
+        if cached is not None:
+            # Already cached, store directly
+            self.prefetch_queue[cache_key] = cached
+            return
+
+        # Submit async fetch to executor
+        future = self.executor.submit(
+            self._fetch_with_cache,
+            messages,
+            max_tokens,
+            top_logprobs,
+            temperature,
+            top_p,
+            cache_key,
+        )
+        self.prefetch_queue[cache_key] = future
+
+    def _fetch_with_cache(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        top_logprobs: int,
+        temperature: float,
+        top_p: float,
+        cache_key: str,
+    ) -> Optional[TeacherOutput]:
+        """Internal method to fetch with caching (for executor)."""
+        try:
+            output = self.backend.get_logprobs(
+                messages=messages,
+                max_tokens=max_tokens,
+                top_logprobs=top_logprobs,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            self._save_to_cache(cache_key, output)
+            return output
+        except Exception as e:
+            # If fetch fails, try cache
+            print(f"Prefetch failed: {e}, trying cache...")
+            cached = self._get_from_cache(cache_key)
+            if cached:
+                self.trained_from_cache += 1
+            return cached
+
+    def get_prefetched(
+        self,
+        prompt: str,
+        max_tokens: int = 128,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_logprobs: int = 20,
+        timeout: float = 10.0,
+    ) -> Optional[TeacherOutput]:
+        """
+        Get a prefetched KD distribution.
+        If not yet ready, waits up to timeout seconds.
+        If rate limited or failed, returns cached version if available.
+
+        Args:
+            prompt: Text prompt
+            max_tokens: Max tokens
+            temperature: Temperature
+            top_p: Top-p
+            top_logprobs: Top logprobs count
+            timeout: Max wait time in seconds
 
         Returns:
-            List of probability distributions
+            TeacherOutput or None if not available
         """
-        output = self.get_teacher_distribution(prompt, **kwargs)
+        messages = [{"role": "user", "content": prompt}]
 
-        # Match output tokens to target tokens
-        # This is a simplified version; in practice you may need alignment
-        distributions = []
-        for i, target_tok in enumerate(target_tokens):
-            if i < len(output.normalized_probs):
-                distributions.append(output.normalized_probs[i])
-            else:
-                distributions.append({})
+        cache_key = self._get_cache_key(
+            messages=messages,
+            max_tokens=max_tokens,
+            top_logprobs=top_logprobs,
+            temperature=temperature,
+            top_p=top_p,
+        )
 
-        return distributions
+        # Check prefetch queue
+        if cache_key in self.prefetch_queue:
+            result = self.prefetch_queue[cache_key]
+
+            # If it's already a TeacherOutput (cached), return directly
+            if isinstance(result, TeacherOutput):
+                del self.prefetch_queue[cache_key]
+                return result
+
+            # Otherwise it's a Future, wait for it
+            try:
+                output = result.result(timeout=timeout)
+                del self.prefetch_queue[cache_key]
+                return output
+            except Exception as e:
+                print(f"Failed to get prefetched result: {e}")
+                # Fall through to direct fetch
+
+        # Not prefetched, fetch directly
+        return self.get_teacher_distribution(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_logprobs=top_logprobs,
+        )
+
+    def clear_prefetch_queue(self):
+        """Clear the prefetch queue."""
+        self.prefetch_queue.clear()
+
+    def get_cache_stats(self) -> Dict:
+        """
+        Get cache and load statistics.
+
+        Returns:
+            Dict with hits, misses, hit rate, and adaptive load metrics
+        """
+        total = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total if total > 0 else 0.0
+
+        return {
+            "hits": self.cache_hits,
+            "misses": self.cache_misses,
+            "total_requests": total,
+            "hit_rate": hit_rate,
+            "trained_from_cache": self.trained_from_cache,
+            "rate_limit_count": self.rate_limit_count,
+            "current_top_logprobs": self.adaptive_top_logprobs,
+            "successful_window_count": self.successful_window_count,
+        }
+
+    def print_cache_stats(self):
+        """Print cache and load statistics."""
+        stats = self.get_cache_stats()
+        print(f"\nKD Cache & Load Statistics:")
+        print(f"  Cache hits: {stats['hits']}")
+        print(f"  Cache misses: {stats['misses']}")
+        print(f"  Total requests: {stats['total_requests']}")
+        print(f"  Hit rate: {stats['hit_rate']:.2%}")
+        print(f"  Trained from cache: {stats['trained_from_cache']}")
+        print(f"  Rate limit events: {stats['rate_limit_count']}")
+        print(f"  Current top_logprobs: {stats['current_top_logprobs']}")
+        print(f"  Successful window: {stats['successful_window_count']}/{self.windows_before_restore}")
 
 
 def test_client():
-    """Test the KD client."""
-    client = VeniceKDClient()
+    """Test KD client with current backend."""
+    print("Testing KD Client...")
+    print(f"Backend: {os.getenv('TEACHER_BACKEND', 'venice')}")
 
-    print("Testing Venice KD Client...")
+    client = KDClient()
+
     output = client.get_teacher_distribution(
         prompt="Say hello in one word",
         max_tokens=5,
@@ -336,14 +540,15 @@ def test_client():
         top_logprobs=5,
     )
 
-    print(f"\nGenerated text: {output.full_text}")
-    print(f"\nTokens: {output.tokens}")
+    print(f"\nGenerated tokens: {output.tokens}")
     print("\nTop probabilities per position:")
     for i, (token, probs) in enumerate(zip(output.tokens, output.normalized_probs)):
         print(f"\nPosition {i} (token: '{token}'):")
         sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)[:5]
         for tok, prob in sorted_probs:
             print(f"  '{tok}': {prob:.4f}")
+
+    client.print_cache_stats()
 
 
 if __name__ == "__main__":
