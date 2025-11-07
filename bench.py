@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from student.sampler import LatentSampler, load_models
-from kd.kd_client import VeniceKDClient
+from kd.kd_client import KDClient
 from ae.tokenizer_adapter import TokenizerAdapter
 
 try:
@@ -22,6 +22,14 @@ try:
     HAS_TABULATE = True
 except ImportError:
     HAS_TABULATE = False
+
+# GB10 Acceptance Gates
+ACCEPTANCE_GATES = {
+    "min_tokens_per_sec": 10.0,  # Minimum throughput
+    "min_token_accuracy": 0.80,  # Minimum AE reconstruction accuracy (80%)
+    "max_avg_kl_divergence": 5.0,  # Maximum KL to teacher
+    "min_kd_cache_hit_rate": 0.50,  # Minimum cache hit rate after warmup (50%)
+}
 
 
 # Default benchmark prompts
@@ -41,7 +49,7 @@ def benchmark_generation(
     num_runs: int = 3,
 ) -> Dict:
     """
-    Benchmark generation performance.
+    Benchmark generation performance with percentile metrics.
 
     Args:
         sampler: LatentSampler instance
@@ -50,7 +58,7 @@ def benchmark_generation(
         num_runs: Number of runs per prompt
 
     Returns:
-        Benchmark results dictionary
+        Benchmark results dictionary with p50/p95 latencies
     """
     results = {
         "prompts": [],
@@ -60,6 +68,8 @@ def benchmark_generation(
     total_latent_steps = 0
     total_tokens = 0
     total_time = 0.0
+    all_latencies = []  # For percentile calculation
+    all_tokens_per_sec = []  # For percentile calculation
 
     print(f"\n{'='*60}")
     print(f"Running benchmark...")
@@ -124,6 +134,8 @@ def benchmark_generation(
             total_latent_steps += num_latent_steps
             total_tokens += num_tokens
             total_time += elapsed
+            all_latencies.append(elapsed)
+            all_tokens_per_sec.append(tokens_per_sec)
 
             print(
                 f"  Run {run + 1}: {elapsed:.3f}s | "
@@ -144,10 +156,28 @@ def benchmark_generation(
             }
         )
 
-    # Overall summary
+    # Overall summary with percentiles
     avg_latent_steps_per_sec = total_latent_steps / total_time
     avg_tokens_per_sec = total_tokens / total_time
     compression_ratio = sampler.k
+
+    # Calculate percentiles
+    all_latencies.sort()
+    all_tokens_per_sec.sort()
+
+    p50_latency = all_latencies[len(all_latencies) // 2] if all_latencies else 0
+    p95_latency = all_latencies[int(len(all_latencies) * 0.95)] if all_latencies else 0
+    p50_tokens_per_sec = all_tokens_per_sec[len(all_tokens_per_sec) // 2] if all_tokens_per_sec else 0
+    p95_tokens_per_sec = all_tokens_per_sec[int(len(all_tokens_per_sec) * 0.95)] if all_tokens_per_sec else 0
+
+    # GPU memory (if available)
+    gpu_memory_stats = {}
+    if torch.cuda.is_available():
+        gpu_memory_stats = {
+            "peak_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+            "peak_reserved_gb": torch.cuda.max_memory_reserved() / 1e9,
+            "current_allocated_gb": torch.cuda.memory_allocated() / 1e9,
+        }
 
     results["summary"] = {
         "total_prompts": len(prompts),
@@ -159,6 +189,11 @@ def benchmark_generation(
         "avg_tokens_per_sec": avg_tokens_per_sec,
         "compression_ratio": compression_ratio,
         "speedup_factor": f"{compression_ratio}x fewer AR steps vs token LLM",
+        "latency_p50": p50_latency,
+        "latency_p95": p95_latency,
+        "tokens_per_sec_p50": p50_tokens_per_sec,
+        "tokens_per_sec_p95": p95_tokens_per_sec,
+        "gpu_memory": gpu_memory_stats,
     }
 
     return results
@@ -167,7 +202,7 @@ def benchmark_generation(
 def evaluate_on_toy_set(
     sampler: LatentSampler,
     data_path: str,
-    kd_client: Optional[VeniceKDClient] = None,
+    kd_client: Optional[KDClient] = None,
     num_samples: int = 100,
     num_kd_samples: int = 10,
 ) -> Dict:
@@ -331,8 +366,79 @@ def evaluate_on_toy_set(
     return results
 
 
+def check_acceptance_gates(results: Dict) -> Dict:
+    """
+    Check if benchmark results pass acceptance gates.
+
+    Args:
+        results: Benchmark results dictionary
+
+    Returns:
+        Dict with gate check results and pass/fail status
+    """
+    gate_results = {
+        "passed": True,
+        "gates": {},
+    }
+
+    summary = results.get("summary", {})
+    evaluation = results.get("evaluation", {})
+    reconstruction = evaluation.get("reconstruction", {})
+    kl_to_teacher = evaluation.get("kl_to_teacher", {})
+
+    # Gate 1: Minimum throughput
+    tokens_per_sec = summary.get("avg_tokens_per_sec", 0)
+    gate_results["gates"]["tokens_per_sec"] = {
+        "value": tokens_per_sec,
+        "threshold": ACCEPTANCE_GATES["min_tokens_per_sec"],
+        "passed": tokens_per_sec >= ACCEPTANCE_GATES["min_tokens_per_sec"],
+        "name": "Minimum Throughput",
+    }
+    if not gate_results["gates"]["tokens_per_sec"]["passed"]:
+        gate_results["passed"] = False
+
+    # Gate 2: Minimum token accuracy (if eval was run)
+    if reconstruction:
+        token_accuracy = reconstruction.get("token_accuracy", 0)
+        gate_results["gates"]["token_accuracy"] = {
+            "value": token_accuracy,
+            "threshold": ACCEPTANCE_GATES["min_token_accuracy"],
+            "passed": token_accuracy >= ACCEPTANCE_GATES["min_token_accuracy"],
+            "name": "AE Reconstruction Accuracy",
+        }
+        if not gate_results["gates"]["token_accuracy"]["passed"]:
+            gate_results["passed"] = False
+
+    # Gate 3: Maximum KL divergence (if eval was run)
+    if kl_to_teacher:
+        avg_kl = kl_to_teacher.get("avg_kl_divergence", float("inf"))
+        gate_results["gates"]["kl_divergence"] = {
+            "value": avg_kl,
+            "threshold": ACCEPTANCE_GATES["max_avg_kl_divergence"],
+            "passed": avg_kl <= ACCEPTANCE_GATES["max_avg_kl_divergence"],
+            "name": "KL Divergence to Teacher",
+        }
+        if not gate_results["gates"]["kl_divergence"]["passed"]:
+            gate_results["passed"] = False
+
+    # Gate 4: KD cache hit rate (if available)
+    kd_cache_stats = evaluation.get("kd_cache_stats", {})
+    if kd_cache_stats:
+        hit_rate = kd_cache_stats.get("hit_rate", 0)
+        gate_results["gates"]["kd_cache_hit_rate"] = {
+            "value": hit_rate,
+            "threshold": ACCEPTANCE_GATES["min_kd_cache_hit_rate"],
+            "passed": hit_rate >= ACCEPTANCE_GATES["min_kd_cache_hit_rate"],
+            "name": "KD Cache Hit Rate",
+        }
+        if not gate_results["gates"]["kd_cache_hit_rate"]["passed"]:
+            gate_results["passed"] = False
+
+    return gate_results
+
+
 def print_summary(results: Dict):
-    """Print benchmark summary."""
+    """Print benchmark summary with acceptance gates."""
     print(f"\n{'='*60}")
     print(f"BENCHMARK SUMMARY")
     print(f"{'='*60}")
@@ -344,10 +450,23 @@ def print_summary(results: Dict):
     print(f"  Total time: {summary['total_time']:.2f}s")
     print(f"\nThroughput:")
     print(f"  Latent steps/sec: {summary['avg_latent_steps_per_sec']:.2f}")
-    print(f"  Tokens/sec: {summary['avg_tokens_per_sec']:.2f}")
+    print(f"  Tokens/sec (avg): {summary['avg_tokens_per_sec']:.2f}")
+    print(f"  Tokens/sec (p50): {summary['tokens_per_sec_p50']:.2f}")
+    print(f"  Tokens/sec (p95): {summary['tokens_per_sec_p95']:.2f}")
+    print(f"\nLatency:")
+    print(f"  Latency (p50): {summary['latency_p50']:.3f}s")
+    print(f"  Latency (p95): {summary['latency_p95']:.3f}s")
     print(f"\nCompression:")
     print(f"  K (compression ratio): {summary['compression_ratio']}")
     print(f"  AR steps reduction: {summary['speedup_factor']}")
+
+    # GPU memory
+    if summary.get("gpu_memory"):
+        gpu_mem = summary["gpu_memory"]
+        print(f"\nGPU Memory (GB10):")
+        print(f"  Peak allocated: {gpu_mem['peak_allocated_gb']:.2f} GB")
+        print(f"  Peak reserved: {gpu_mem['peak_reserved_gb']:.2f} GB")
+        print(f"  Current allocated: {gpu_mem['current_allocated_gb']:.2f} GB")
 
     print(f"\n{'='*60}\n")
 
@@ -438,7 +557,7 @@ def main():
         # Initialize KD client if available
         kd_client = None
         try:
-            kd_client = VeniceKDClient()
+            kd_client = KDClient()
             print("✅ KD client initialized for teacher KL evaluation")
         except Exception as e:
             print(f"⚠️  KD client initialization failed: {e}")
@@ -454,6 +573,32 @@ def main():
 
         # Add eval results to main results
         results["evaluation"] = eval_results
+
+        # Add KD cache stats if available
+        if kd_client:
+            results["evaluation"]["kd_cache_stats"] = kd_client.get_cache_stats()
+
+    # Check acceptance gates
+    gate_results = check_acceptance_gates(results)
+    results["acceptance_gates"] = gate_results
+
+    # Print gate results
+    print(f"\n{'='*60}")
+    print(f"ACCEPTANCE GATES")
+    print(f"{'='*60}")
+    for gate_name, gate_data in gate_results["gates"].items():
+        status_emoji = "✅" if gate_data["passed"] else "❌"
+        print(f"\n{status_emoji} {gate_data['name']}:")
+        print(f"  Value: {gate_data['value']:.4f}")
+        print(f"  Threshold: {gate_data['threshold']:.4f}")
+        print(f"  Status: {'PASS' if gate_data['passed'] else 'FAIL'}")
+
+    print(f"\n{'='*60}")
+    if gate_results["passed"]:
+        print(f"✅ ALL ACCEPTANCE GATES PASSED")
+    else:
+        print(f"❌ SOME ACCEPTANCE GATES FAILED")
+    print(f"{'='*60}\n")
 
     # Save results
     if args.output:
